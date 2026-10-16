@@ -1,0 +1,1312 @@
+name: PLAN Bounded IMPLEMENT Worker
+
+on:
+  workflow_run:
+    workflows: ["Trusted PLAN IMPLEMENT Handoff", "Trusted Worker Recovery Preflight"]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  prepare0:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == github.event.repository.default_branch
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      should_run: ${{ steps.source.outputs.should_run }}
+      source_name: ${{ steps.source.outputs.name }}
+      source_id: ${{ steps.source.outputs.id }}
+      source_digest: ${{ steps.source.outputs.digest }}
+      source_run_id: ${{ steps.source.outputs.run_id }}
+      source_run_attempt: ${{ steps.source.outputs.run_attempt }}
+      recovery_guard_kind: ${{ steps.source.outputs.recovery_kind }}
+      recovery_base_sha: ${{ steps.source.outputs.recovery_base_sha }}
+      recovery_current_sha: ${{ steps.source.outputs.recovery_current_sha }}
+      base_sha: ${{ steps.base.outputs.sha }}
+      candidate_artifact_name: ${{ steps.prepare.outputs.candidate_artifact_name }}
+      issue_number: ${{ steps.request_input.outputs.issue_number }}
+      request_artifact_name: ${{ steps.request_input.outputs.artifact_name }}
+      request_artifact_id: ${{ steps.request_upload.outputs.artifact-id }}
+      request_artifact_digest: ${{ steps.request_upload.outputs.artifact-digest }}
+
+    steps:
+      - name: RECOVERY_READY artifact 다운로드
+        if: github.event.workflow_run.name == 'Trusted Worker Recovery Preflight'
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/worker-recovery-source
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Trusted handoff artifact exact 선택
+        id: source
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            if (
+              run.name === 'Trusted Worker Recovery Preflight' &&
+              run.path === '.github/workflows/plan-worker-recovery-preflight.yml' &&
+              run.event === 'workflow_dispatch'
+            ) {
+              const fs = require('fs');
+              const path = require('path');
+              const root = process.env.RUNNER_TEMP + '/worker-recovery-source';
+              const found = [];
+              const walk = (dir) => {
+                for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                  const full = path.join(dir, entry.name);
+                  if (entry.isDirectory()) walk(full);
+                  else if (entry.isFile() && entry.name === 'recovery.json') found.push(full);
+                }
+              };
+              if (fs.existsSync(root)) walk(root);
+              if (found.length !== 1) {
+                core.setFailed(`expected exactly one RECOVERY_READY payload; actual=${found.length}`);
+                return;
+              }
+
+              const recovery = JSON.parse(fs.readFileSync(found[0], 'utf8'));
+              const defaultBranch = context.payload.repository.default_branch;
+              const { data: branch } = await github.rest.repos.getBranch({
+                ...context.repo,
+                branch: defaultBranch,
+              });
+              const handoff = recovery.sourceHandoff;
+              const artifact = handoff?.artifact;
+              const valid =
+                recovery.schemaVersion === 1 &&
+                recovery.kind === 'trusted-worker-recovery-ready' &&
+                recovery.repository === `${context.repo.owner}/${context.repo.repo}` &&
+                Number.isSafeInteger(recovery.issueNumber) && recovery.issueNumber > 0 &&
+                /^[0-9a-f]{40,64}$/.test(recovery.approvedBaseSha || '') &&
+                recovery.currentDefaultSha === run.head_sha &&
+                branch.commit.sha === run.head_sha &&
+                recovery.preflight?.workflowPath === '.github/workflows/plan-worker-recovery-preflight.yml' &&
+                recovery.preflight?.runId === run.id &&
+                recovery.preflight?.runAttempt === run.run_attempt &&
+                recovery.preflight?.trustedCodeSha === run.head_sha &&
+                Number.isSafeInteger(handoff?.runId) && handoff.runId > 0 &&
+                Number.isSafeInteger(handoff?.runAttempt) && handoff.runAttempt > 0 &&
+                Number.isSafeInteger(artifact?.id) && artifact.id > 0 &&
+                /^plan-implement-handoff-issue-\d+-plan-\d+-attempt-\d+-approval-\d+$/.test(artifact?.name || '') &&
+                /^sha256:[0-9a-f]{64}$/.test(artifact?.digest || '');
+              if (!valid) {
+                core.setFailed('invalid RECOVERY_READY provenance');
+                return;
+              }
+
+              core.setOutput('should_run', 'true');
+              core.setOutput('name', artifact.name);
+              core.setOutput('id', String(artifact.id));
+              core.setOutput('digest', artifact.digest);
+              core.setOutput('run_id', String(handoff.runId));
+              core.setOutput('run_attempt', String(handoff.runAttempt));
+              core.setOutput('recovery_kind', 'trusted-recovery-compare-v1');
+              core.setOutput('recovery_base_sha', recovery.approvedBaseSha);
+              core.setOutput('recovery_current_sha', recovery.currentDefaultSha);
+              return;
+            }
+            if (run.name !== 'Trusted PLAN IMPLEMENT Handoff' || run.path !== '.github/workflows/plan-implement-handoff.yml' || run.event !== 'workflow_run') {
+              core.setFailed(`unexpected source handoff workflow: ${run.name} ${run.path}`);
+              return;
+            }
+
+            const { data } = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: run.id,
+              per_page: 100,
+            });
+            const pattern = /^plan-implement-handoff-issue-\d+-plan-\d+-attempt-\d+-approval-\d+$/;
+            const matches = data.artifacts.filter((artifact) => !artifact.expired && pattern.test(artifact.name));
+
+            if (matches.length === 1) {
+              const artifact = matches[0];
+              core.setOutput('should_run', 'true');
+              core.setOutput('name', artifact.name);
+              core.setOutput('id', String(artifact.id));
+              core.setOutput('digest', artifact.digest ?? '');
+              core.setOutput('run_id', String(run.id));
+              core.setOutput('run_attempt', String(run.run_attempt));
+              return;
+            }
+
+            if (matches.length === 0) {
+              const { data: jobsData } = await github.rest.actions.listJobsForWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: run.id,
+                filter: 'latest',
+                per_page: 100,
+              });
+              const handoffJobs = jobsData.jobs.filter((job) => job.name === 'handoff');
+              if (handoffJobs.length === 1 && handoffJobs[0].conclusion === 'skipped') {
+                core.info('source handoff job was skipped; Worker is a no-op');
+                core.setOutput('should_run', 'false');
+                return;
+              }
+            }
+
+            core.setFailed(`expected exactly one trusted handoff artifact; found=${matches.length}`);
+
+      - name: Trusted preparation checkout
+        if: steps.source.outputs.should_run == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+          path: control-prep
+
+      - name: Framework runtime layout 준비
+        if: steps.source.outputs.should_run == 'true'
+        working-directory: control-prep
+        run: |
+          if grep -q '"name": "self-improvement-mvp"' package.json; then
+            mkdir -p .framework-runtime
+            cp package.json package-lock.json .framework-runtime/
+          fi
+
+      - name: Node 설정
+        if: steps.source.outputs.should_run == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: control-prep/.framework-runtime/package-lock.json
+
+      - name: Trusted preparation dependencies 설치
+        if: steps.source.outputs.should_run == 'true'
+        working-directory: control-prep
+        run: |
+          npm ci --ignore-scripts --prefix .framework-runtime
+          ln -sT .framework-runtime/node_modules node_modules
+
+      - name: Trusted handoff artifact 다운로드
+        if: steps.source.outputs.should_run == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.source.outputs.name }}
+          path: ${{ runner.temp }}/plan-worker-source
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.source.outputs.run_id }}
+
+      - name: Trusted Worker input 검증 및 준비
+        if: steps.source.outputs.should_run == 'true'
+        id: prepare
+        working-directory: control-prep
+        run: .framework-runtime/node_modules/.bin/tsx src/self-improvement/plan-implement-worker-handler.ts prepare
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SOURCE_RUN_ID: ${{ steps.source.outputs.run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ steps.source.outputs.run_attempt }}
+          SOURCE_ARTIFACT_NAME: ${{ steps.source.outputs.name }}
+          SOURCE_ARTIFACT_ID: ${{ steps.source.outputs.id }}
+          SOURCE_ARTIFACT_DIGEST: ${{ steps.source.outputs.digest }}
+          RECOVERY_GUARD_KIND: ${{ steps.source.outputs.recovery_kind }}
+          RECOVERY_BASE_SHA: ${{ steps.source.outputs.recovery_base_sha }}
+          RECOVERY_CURRENT_SHA: ${{ steps.source.outputs.recovery_current_sha }}
+          WORKER_RUN_ID: ${{ github.run_id }}
+          WORKER_RUN_ATTEMPT: ${{ github.run_attempt }}
+          SOURCE_DIRECTORY: ${{ runner.temp }}/plan-worker-source
+          WORKER_INPUT_DIRECTORY: ${{ runner.temp }}/plan-worker-input
+
+      - name: exact approved base SHA 고정
+        if: steps.source.outputs.should_run == 'true'
+        id: base
+        shell: bash
+        env:
+          CONTRACT_JSON: ${{ runner.temp }}/plan-worker-source/contract.json
+        run: |
+          set -euo pipefail
+          BASE_SHA="$(node -e 'const fs=require("fs"); const x=JSON.parse(fs.readFileSync(process.env.CONTRACT_JSON,"utf8")); if(typeof x.baseSha!=="string" || !/^[0-9a-f]{40,64}$/.test(x.baseSha)) process.exit(2); process.stdout.write(x.baseSha)')"
+          echo "sha=${BASE_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: IMPLEMENT_REQUEST 입력 고정
+        if: steps.source.outputs.should_run == 'true'
+        id: request_input
+        uses: actions/github-script@v7
+        env:
+          HANDOFF_JSON: ${{ runner.temp }}/plan-worker-source/handoff.json
+          WORKER_INPUT_DIRECTORY: ${{ runner.temp }}/plan-worker-input
+          REQUEST_DIRECTORY: ${{ runner.temp }}/implement-request
+          SOURCE_RUN_ID: ${{ steps.source.outputs.run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ steps.source.outputs.run_attempt }}
+          SOURCE_ARTIFACT_NAME: ${{ steps.source.outputs.name }}
+          SOURCE_ARTIFACT_ID: ${{ steps.source.outputs.id }}
+          SOURCE_ARTIFACT_DIGEST: ${{ steps.source.outputs.digest }}
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        with:
+          script: |
+            // BEGIN implement-identity
+            // Private subscription-ai-executor(main 735abd2) verify-request와 같은 exact identity schema.
+            const IMPLEMENT_SUBSCRIPTION_MODEL = 'sonnet';
+
+            function assertExactKeys(value, keys, name) {
+              if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${name} must be an object`);
+              const actual = Object.keys(value).sort().join(',');
+              if (actual !== [...keys].sort().join(',')) throw new Error(`${name} fields mismatch: ${actual}`);
+            }
+
+            function assertPositiveInteger(value, name) {
+              if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name} must be a positive integer`);
+            }
+
+            function assertDigest(value, name) {
+              if (typeof value !== 'string' || !/^[0-9a-f]{64}$/.test(value)) throw new Error(`${name} must be a lowercase SHA-256 digest`);
+            }
+
+            function assertArtifact(value, name) {
+              assertExactKeys(value, ['name', 'id', 'digest'], name);
+              if (typeof value.name !== 'string' || !value.name.trim()) throw new Error(`${name}.name must be non-empty`);
+              assertPositiveInteger(value.id, `${name}.id`);
+              assertDigest(value.digest, `${name}.digest`);
+            }
+
+            function assertImplementIdentity(identity) {
+              assertExactKeys(identity, [
+                'schemaVersion', 'kind', 'repository', 'issueNumber', 'baseSha', 'approvedPlan',
+                'approvalCommentId', 'planAuthorize', 'handoff', 'worker', 'model',
+              ], 'IMPLEMENT identity');
+              if (identity.schemaVersion !== 1 || identity.kind !== 'trusted-implement-request') throw new Error('Unsupported IMPLEMENT identity schema');
+              if (identity.model !== IMPLEMENT_SUBSCRIPTION_MODEL) throw new Error('IMPLEMENT model must be sonnet');
+              assertPositiveInteger(identity.issueNumber, 'issueNumber');
+              if (typeof identity.baseSha !== 'string' || !/^[0-9a-f]{40,64}$/.test(identity.baseSha)) throw new Error('baseSha is invalid');
+              assertPositiveInteger(identity.approvalCommentId, 'approvalCommentId');
+              assertExactKeys(identity.approvedPlan, ['runId', 'runAttempt', 'artifactName'], 'approvedPlan');
+              assertPositiveInteger(identity.approvedPlan.runId, 'approvedPlan.runId');
+              assertPositiveInteger(identity.approvedPlan.runAttempt, 'approvedPlan.runAttempt');
+              if (typeof identity.approvedPlan.artifactName !== 'string' || !identity.approvedPlan.artifactName.trim()) throw new Error('approvedPlan.artifactName must be non-empty');
+              assertExactKeys(identity.planAuthorize, ['runId', 'runAttempt', 'artifact'], 'planAuthorize');
+              assertPositiveInteger(identity.planAuthorize.runId, 'planAuthorize.runId');
+              assertPositiveInteger(identity.planAuthorize.runAttempt, 'planAuthorize.runAttempt');
+              assertArtifact(identity.planAuthorize.artifact, 'planAuthorize.artifact');
+              assertExactKeys(identity.handoff, ['runId', 'runAttempt', 'artifact', 'handoffDigest'], 'handoff');
+              assertPositiveInteger(identity.handoff.runId, 'handoff.runId');
+              assertPositiveInteger(identity.handoff.runAttempt, 'handoff.runAttempt');
+              assertArtifact(identity.handoff.artifact, 'handoff.artifact');
+              assertDigest(identity.handoff.handoffDigest, 'handoff.handoffDigest');
+              assertExactKeys(identity.worker, ['runId', 'runAttempt'], 'worker');
+              assertPositiveInteger(identity.worker.runId, 'worker.runId');
+              assertPositiveInteger(identity.worker.runAttempt, 'worker.runAttempt');
+              return identity;
+            }
+
+            // trusted Handoff manifest와 source step 값만으로 identity를 만든다. credential은 들어가지 않는다.
+            function buildImplementIdentity({ handoff, repository, baseSha, source, worker }) {
+              const digest = /^sha256:([0-9a-f]{64})$/.exec(source.digest || '');
+              if (!digest) throw new Error('Handoff artifact digest must be sha256:<64hex>');
+              if (!handoff || handoff.kind !== 'trusted-plan-implement-handoff' || handoff.repository !== repository || handoff.baseSha !== baseSha) {
+                throw new Error('Handoff manifest identity mismatch');
+              }
+              const authorize = handoff.sourcePlanAuthorize || {};
+              // shorthand로 둔다: 줄 시작 'model:'은 workflow AI 호출 수 검사에서 YAML model key로 읽힌다.
+              const model = IMPLEMENT_SUBSCRIPTION_MODEL;
+              return assertImplementIdentity({
+                schemaVersion: 1,
+                kind: 'trusted-implement-request',
+                repository,
+                issueNumber: handoff.issueNumber,
+                baseSha,
+                approvedPlan: {
+                  runId: handoff.approvedPlan?.runId,
+                  runAttempt: handoff.approvedPlan?.runAttempt,
+                  artifactName: handoff.approvedPlan?.artifactName,
+                },
+                approvalCommentId: handoff.approvalCommentId,
+                planAuthorize: {
+                  runId: authorize.runId,
+                  runAttempt: authorize.runAttempt,
+                  artifact: { name: authorize.artifact?.name, id: authorize.artifact?.id, digest: authorize.artifact?.digest },
+                },
+                handoff: {
+                  runId: Number(source.runId),
+                  runAttempt: Number(source.runAttempt),
+                  artifact: { name: source.name, id: Number(source.id), digest: digest[1] },
+                  handoffDigest: handoff.handoffDigest,
+                },
+                worker: { runId: Number(worker.runId), runAttempt: Number(worker.runAttempt) },
+                model,
+              });
+            }
+            // END implement-identity
+            const fs = require('fs');
+            const path = require('path');
+            const identity = buildImplementIdentity({
+              handoff: JSON.parse(fs.readFileSync(process.env.HANDOFF_JSON, 'utf8')),
+              repository: `${context.repo.owner}/${context.repo.repo}`,
+              baseSha: process.env.BASE_SHA,
+              source: {
+                runId: process.env.SOURCE_RUN_ID,
+                runAttempt: process.env.SOURCE_RUN_ATTEMPT,
+                name: process.env.SOURCE_ARTIFACT_NAME,
+                id: process.env.SOURCE_ARTIFACT_ID,
+                digest: process.env.SOURCE_ARTIFACT_DIGEST,
+              },
+              worker: { runId: context.runId, runAttempt: process.env.GITHUB_RUN_ATTEMPT },
+            });
+            // Private Executor는 artifact root의 정확히 이 3개 파일만 받는다. prompt/schema는 prepare 출력 그대로다.
+            const directory = process.env.REQUEST_DIRECTORY;
+            fs.mkdirSync(directory, { recursive: true });
+            fs.writeFileSync(path.join(directory, 'identity.json'), `${JSON.stringify(identity, null, 2)}\n`);
+            for (const name of ['prompt.md', 'schema.json']) {
+              fs.copyFileSync(path.join(process.env.WORKER_INPUT_DIRECTORY, name), path.join(directory, name));
+            }
+            if (fs.readdirSync(directory).sort().join(',') !== 'identity.json,prompt.md,schema.json') {
+              throw new Error('IMPLEMENT request directory must contain exactly identity.json, prompt.md and schema.json');
+            }
+            core.setOutput('issue_number', String(identity.issueNumber));
+            core.setOutput('artifact_name', `implement-request-issue-${identity.issueNumber}-worker-${identity.worker.runId}-attempt-${identity.worker.runAttempt}`);
+
+      - name: IMPLEMENT_REQUEST artifact 저장
+        if: steps.source.outputs.should_run == 'true'
+        id: request_upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.request_input.outputs.artifact_name }}
+          path: ${{ runner.temp }}/implement-request
+          if-no-files-found: error
+
+  subscription0:
+    needs: prepare0
+    if: needs.prepare0.outputs.should_run == 'true'
+    permissions:
+      actions: read
+      issues: write
+    uses: ./.github/workflows/subscription-exchange.yml
+    with:
+      kind: IMPLEMENT
+      label: 최초 IMPLEMENT
+      issue_number: ${{ needs.prepare0.outputs.issue_number }}
+      request_artifact_name: ${{ needs.prepare0.outputs.request_artifact_name }}
+      request_artifact_id: ${{ needs.prepare0.outputs.request_artifact_id }}
+      request_artifact_digest: ${{ needs.prepare0.outputs.request_artifact_digest }}
+      result_artifact_name: bounded-worker-raw-proposal-0-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+      result_file_name: raw-proposal.json
+    secrets:
+      EXECUTOR_DISPATCH_TOKEN: ${{ secrets.EXECUTOR_DISPATCH_TOKEN }}
+
+  attempt0:
+    needs: [prepare0, subscription0]
+    # prepare0/subscription0 실패도 attempt0 실패로 모아 기존 INFRA_FAILURE 경로로 보낸다.
+    if: "!cancelled() && needs.prepare0.outputs.should_run == 'true'"
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      should_run: ${{ needs.prepare0.outputs.should_run }}
+      source_name: ${{ needs.prepare0.outputs.source_name }}
+      source_id: ${{ needs.prepare0.outputs.source_id }}
+      source_digest: ${{ needs.prepare0.outputs.source_digest }}
+      source_run_id: ${{ needs.prepare0.outputs.source_run_id }}
+      source_run_attempt: ${{ needs.prepare0.outputs.source_run_attempt }}
+      recovery_guard_kind: ${{ needs.prepare0.outputs.recovery_guard_kind }}
+      recovery_base_sha: ${{ needs.prepare0.outputs.recovery_base_sha }}
+      recovery_current_sha: ${{ needs.prepare0.outputs.recovery_current_sha }}
+      base_sha: ${{ needs.prepare0.outputs.base_sha }}
+      candidate_artifact_name: ${{ needs.prepare0.outputs.candidate_artifact_name }}
+      issue_number: ${{ needs.prepare0.outputs.issue_number }}
+      request_artifact_name: ${{ needs.prepare0.outputs.request_artifact_name }}
+      repair_request_artifact_name: ${{ steps.repair_request_input.outputs.artifact_name }}
+      repair_request_artifact_id: ${{ steps.repair_request_upload.outputs.artifact-id }}
+      repair_request_artifact_digest: ${{ steps.repair_request_upload.outputs.artifact-digest }}
+      ci_status: ${{ steps.ci0.outputs.status }}
+      repair_ready: ${{ steps.ci0.outputs.repair_ready }}
+      repair_blocked_reason: ${{ steps.ci0.outputs.repair_blocked_reason }}
+      worker_incomplete: ${{ steps.completion0.outputs.incomplete }}
+
+    steps:
+      - name: IMPLEMENT subscription 단계 성공 확인
+        shell: bash
+        env:
+          PREPARE_RESULT: ${{ needs.prepare0.result }}
+          SUBSCRIPTION_RESULT: ${{ needs.subscription0.result }}
+        run: |
+          set -euo pipefail
+          if [ "$PREPARE_RESULT" != "success" ] || [ "$SUBSCRIPTION_RESULT" != "success" ]; then
+            echo "IMPLEMENT subscription failed before a raw proposal could exist: prepare0=${PREPARE_RESULT}, subscription0=${SUBSCRIPTION_RESULT}" >&2
+            exit 1
+          fi
+
+      - name: IMPLEMENT raw proposal 다운로드 0
+        uses: actions/download-artifact@v4
+        with:
+          name: bounded-worker-raw-proposal-0-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/worker-output
+
+      - name: PLAN Worker complete 상태 분류 0
+        id: completion0
+        shell: bash
+        env:
+          RAW_PROPOSAL: ${{ runner.temp }}/worker-output/raw-proposal.json
+        run: |
+          set -euo pipefail
+          incomplete="$(node -e 'const fs=require("fs"); const x=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); process.stdout.write(x.complete === false ? "true" : "false")' "$RAW_PROPOSAL")"
+          echo "incomplete=$incomplete" >> "$GITHUB_OUTPUT"
+          if [ "$incomplete" = "true" ]; then
+            echo "PLAN Worker가 complete=false를 반환했습니다. infrastructure failure와 구분해 fail-closed 합니다."
+          fi
+
+      - name: Trusted validation checkout 0
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+          path: control-validate-0
+
+      - name: Framework runtime layout 준비
+        working-directory: control-validate-0
+        run: |
+          if grep -q '"name": "self-improvement-mvp"' package.json; then
+            mkdir -p .framework-runtime
+            cp package.json package-lock.json .framework-runtime/
+          fi
+
+      - name: Trusted validation dependencies 설치 0
+        working-directory: control-validate-0
+        run: |
+          npm ci --ignore-scripts --prefix .framework-runtime
+          ln -sT .framework-runtime/node_modules node_modules
+
+      - name: Trusted handoff artifact 재다운로드 0
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.prepare0.outputs.source_name }}
+          path: ${{ runner.temp }}/plan-worker-source-validate-0
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.prepare0.outputs.source_run_id }}
+
+      - name: Trusted candidate 검증 0
+        working-directory: control-validate-0
+        run: .framework-runtime/node_modules/.bin/tsx src/self-improvement/plan-implement-worker-handler.ts validate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SOURCE_RUN_ID: ${{ needs.prepare0.outputs.source_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ needs.prepare0.outputs.source_run_attempt }}
+          SOURCE_ARTIFACT_NAME: ${{ needs.prepare0.outputs.source_name }}
+          SOURCE_ARTIFACT_ID: ${{ needs.prepare0.outputs.source_id }}
+          SOURCE_ARTIFACT_DIGEST: ${{ needs.prepare0.outputs.source_digest }}
+          RECOVERY_GUARD_KIND: ${{ needs.prepare0.outputs.recovery_guard_kind }}
+          RECOVERY_BASE_SHA: ${{ needs.prepare0.outputs.recovery_base_sha }}
+          RECOVERY_CURRENT_SHA: ${{ needs.prepare0.outputs.recovery_current_sha }}
+          WORKER_RUN_ID: ${{ github.run_id }}
+          WORKER_RUN_ATTEMPT: ${{ github.run_attempt }}
+          SOURCE_DIRECTORY: ${{ runner.temp }}/plan-worker-source-validate-0
+          RAW_PROPOSAL_PATH: ${{ runner.temp }}/worker-output/raw-proposal.json
+          CANDIDATE_OUTPUT_DIRECTORY: ${{ runner.temp }}/validated-candidate-0
+
+      - name: exact base candidate CI checkout 0
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare0.outputs.base_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: validation-target-0
+
+      - name: exact base SHA 확인 0
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.prepare0.outputs.base_sha }}
+        run: test "$(git -C "$GITHUB_WORKSPACE/validation-target-0" rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: candidate CI dependencies 설치 0
+        working-directory: validation-target-0
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          NODE_AUTH_TOKEN: ""
+          NPM_TOKEN: ""
+        run: npm ci --ignore-scripts
+
+      - name: deterministic CI 및 repair 입력 준비 0
+        id: ci0
+        working-directory: control-validate-0
+        env:
+          SOURCE_DIRECTORY: ${{ runner.temp }}/plan-worker-source-validate-0
+          CANDIDATE_DIRECTORY: ${{ runner.temp }}/validated-candidate-0
+          TARGET_DIRECTORY: ${{ github.workspace }}/validation-target-0
+          OBSERVED_BASE_SHA: ${{ needs.prepare0.outputs.base_sha }}
+          STATE_DIRECTORY: ${{ runner.temp }}/worker-ci-0
+          NEXT_REPAIR_ATTEMPT: "1"
+          REPAIR_INPUT_DIRECTORY: ${{ runner.temp }}/repair-input-1
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          NODE_AUTH_TOKEN: ""
+          NPM_TOKEN: ""
+        run: .framework-runtime/node_modules/.bin/tsx src/self-improvement/plan-worker-ci-repair-handler.ts check
+
+      - name: attempt 0 state 정리
+        if: steps.ci0.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/worker-state-0/candidate" "$RUNNER_TEMP/worker-state-0/evidence"
+          if [ -f "$RUNNER_TEMP/validated-candidate-0/candidate.json" ]; then
+            cp "$RUNNER_TEMP/validated-candidate-0/candidate.json" "$RUNNER_TEMP/worker-state-0/candidate/candidate.json"
+            cp "$RUNNER_TEMP/validated-candidate-0/candidate-provenance.json" "$RUNNER_TEMP/worker-state-0/candidate/candidate-provenance.json"
+            cp "$RUNNER_TEMP/worker-ci-0/validation.json" "$RUNNER_TEMP/worker-state-0/evidence/validation-0.json"
+          else
+            # candidate 전에 edit 적용에 실패한 attempt: candidate 없이 trusted 실패 기록만 evidence로 남긴다.
+            cp "$RUNNER_TEMP/worker-ci-0/edit-failure.json" "$RUNNER_TEMP/worker-state-0/evidence/edit-failure-0.json"
+          fi
+
+      - name: attempt 0 state artifact 저장
+        if: steps.ci0.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bounded-worker-state-0-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/worker-state-0
+          if-no-files-found: error
+
+      # repair 1도 같은 Worker run identity를 쓰고 prompt/schema만 trusted repair 입력으로 바꾼다. 새 artifact라 request_id가 다르다.
+      - name: repair 1 IMPLEMENT_REQUEST 기준 identity 다운로드
+        if: steps.ci0.outputs.status == 'FAIL' && steps.ci0.outputs.repair_ready == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.prepare0.outputs.request_artifact_name }}
+          path: ${{ runner.temp }}/implement-request-repair-1
+
+      - name: repair 1 IMPLEMENT_REQUEST 입력 고정
+        if: steps.ci0.outputs.status == 'FAIL' && steps.ci0.outputs.repair_ready == 'true'
+        id: repair_request_input
+        shell: bash
+        env:
+          BASE_REQUEST_ARTIFACT_NAME: ${{ needs.prepare0.outputs.request_artifact_name }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/implement-request-repair-1"
+          test "$(find "$dir" -mindepth 1 -maxdepth 1 -printf '%y:%f\n' | sort | tr '\n' ' ')" = "f:identity.json f:prompt.md f:schema.json "
+          cp "$RUNNER_TEMP/repair-input-1/prompt.md" "$dir/prompt.md"
+          cp "$RUNNER_TEMP/repair-input-1/schema.json" "$dir/schema.json"
+          echo "artifact_name=${BASE_REQUEST_ARTIFACT_NAME}-repair-1" >> "$GITHUB_OUTPUT"
+
+      - name: repair 1 IMPLEMENT_REQUEST artifact 저장
+        if: steps.ci0.outputs.status == 'FAIL' && steps.ci0.outputs.repair_ready == 'true'
+        id: repair_request_upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.repair_request_input.outputs.artifact_name }}
+          path: ${{ runner.temp }}/implement-request-repair-1
+          if-no-files-found: error
+
+  attempt0_result:
+    needs: attempt0
+    if: always() && needs.attempt0.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      should_run: ${{ steps.effective.outputs.should_run }}
+      ci_status: ${{ steps.effective.outputs.ci_status }}
+      repair_ready: ${{ steps.effective.outputs.repair_ready }}
+      repair_blocked_reason: ${{ steps.effective.outputs.repair_blocked_reason }}
+      infrastructure_failed: ${{ steps.effective.outputs.infrastructure_failed }}
+      worker_incomplete: ${{ steps.effective.outputs.worker_incomplete }}
+      source_name: ${{ steps.effective.outputs.source_name }}
+      source_id: ${{ steps.effective.outputs.source_id }}
+      source_digest: ${{ steps.effective.outputs.source_digest }}
+      source_run_id: ${{ steps.effective.outputs.source_run_id }}
+      source_run_attempt: ${{ steps.effective.outputs.source_run_attempt }}
+      recovery_guard_kind: ${{ steps.effective.outputs.recovery_guard_kind }}
+      recovery_base_sha: ${{ steps.effective.outputs.recovery_base_sha }}
+      recovery_current_sha: ${{ steps.effective.outputs.recovery_current_sha }}
+      base_sha: ${{ steps.effective.outputs.base_sha }}
+      candidate_artifact_name: ${{ steps.effective.outputs.candidate_artifact_name }}
+      issue_number: ${{ needs.attempt0.outputs.issue_number }}
+      request_artifact_name: ${{ needs.attempt0.outputs.request_artifact_name }}
+      repair_request_artifact_name: ${{ needs.attempt0.outputs.repair_request_artifact_name }}
+      repair_request_artifact_id: ${{ needs.attempt0.outputs.repair_request_artifact_id }}
+      repair_request_artifact_digest: ${{ needs.attempt0.outputs.repair_request_artifact_digest }}
+
+    steps:
+      - name: attempt 0 effective 결과 고정
+        id: effective
+        shell: bash
+        env:
+          SHOULD_RUN: ${{ needs.attempt0.outputs.should_run }}
+          ATTEMPT0_RESULT: ${{ needs.attempt0.result }}
+          DIRECT_STATUS: ${{ needs.attempt0.outputs.ci_status }}
+          DIRECT_REPAIR_READY: ${{ needs.attempt0.outputs.repair_ready }}
+          DIRECT_BLOCKED_REASON: ${{ needs.attempt0.outputs.repair_blocked_reason }}
+          DIRECT_INCOMPLETE: ${{ needs.attempt0.outputs.worker_incomplete }}
+          SOURCE_NAME: ${{ needs.attempt0.outputs.source_name }}
+          SOURCE_ID: ${{ needs.attempt0.outputs.source_id }}
+          SOURCE_DIGEST: ${{ needs.attempt0.outputs.source_digest }}
+          SOURCE_RUN_ID: ${{ needs.attempt0.outputs.source_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ needs.attempt0.outputs.source_run_attempt }}
+          RECOVERY_GUARD_KIND: ${{ needs.attempt0.outputs.recovery_guard_kind }}
+          RECOVERY_BASE_SHA: ${{ needs.attempt0.outputs.recovery_base_sha }}
+          RECOVERY_CURRENT_SHA: ${{ needs.attempt0.outputs.recovery_current_sha }}
+          BASE_SHA: ${{ needs.attempt0.outputs.base_sha }}
+          CANDIDATE_ARTIFACT_NAME: ${{ needs.attempt0.outputs.candidate_artifact_name }}
+        run: |
+          set -euo pipefail
+          infrastructure_failed=false
+          worker_incomplete=false
+          ci_status="$DIRECT_STATUS"
+          repair_ready="$DIRECT_REPAIR_READY"
+          repair_blocked_reason="$DIRECT_BLOCKED_REASON"
+
+          # subscription 결과를 받지 못한 실패(request, dispatch, timeout, identity mismatch)는 모두 attempt0 실패다.
+          if [ "$DIRECT_INCOMPLETE" = "true" ]; then
+            worker_incomplete=true
+            ci_status=""
+            repair_ready=""
+            repair_blocked_reason=""
+          elif [ "$ATTEMPT0_RESULT" != "success" ]; then
+            infrastructure_failed=true
+            ci_status=""
+            repair_ready=""
+            repair_blocked_reason=""
+          fi
+
+          {
+            echo "should_run=$SHOULD_RUN"
+            echo "ci_status=$ci_status"
+            echo "repair_ready=$repair_ready"
+            echo "repair_blocked_reason=$repair_blocked_reason"
+            echo "infrastructure_failed=$infrastructure_failed"
+            echo "worker_incomplete=$worker_incomplete"
+            echo "source_name=$SOURCE_NAME"
+            echo "source_id=$SOURCE_ID"
+            echo "source_digest=$SOURCE_DIGEST"
+            echo "source_run_id=$SOURCE_RUN_ID"
+            echo "source_run_attempt=$SOURCE_RUN_ATTEMPT"
+            echo "recovery_guard_kind=$RECOVERY_GUARD_KIND"
+            echo "recovery_base_sha=$RECOVERY_BASE_SHA"
+            echo "recovery_current_sha=$RECOVERY_CURRENT_SHA"
+            echo "base_sha=$BASE_SHA"
+            echo "candidate_artifact_name=$CANDIDATE_ARTIFACT_NAME"
+          } >> "$GITHUB_OUTPUT"
+
+  subscription1:
+    needs: attempt0_result
+    if: "!cancelled() && needs.attempt0_result.outputs.ci_status == 'FAIL' && needs.attempt0_result.outputs.repair_ready == 'true'"
+    permissions:
+      actions: read
+      issues: write
+    uses: ./.github/workflows/subscription-exchange.yml
+    with:
+      kind: IMPLEMENT
+      label: repair 1
+      issue_number: ${{ needs.attempt0_result.outputs.issue_number }}
+      request_artifact_name: ${{ needs.attempt0_result.outputs.repair_request_artifact_name }}
+      request_artifact_id: ${{ needs.attempt0_result.outputs.repair_request_artifact_id }}
+      request_artifact_digest: ${{ needs.attempt0_result.outputs.repair_request_artifact_digest }}
+      result_artifact_name: bounded-worker-raw-proposal-1-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+      result_file_name: raw-proposal.json
+    secrets:
+      EXECUTOR_DISPATCH_TOKEN: ${{ secrets.EXECUTOR_DISPATCH_TOKEN }}
+
+  repair1:
+    needs: [attempt0_result, subscription1]
+    if: >-
+      !cancelled() &&
+      needs.attempt0_result.outputs.ci_status == 'FAIL' &&
+      needs.attempt0_result.outputs.repair_ready == 'true'
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      ci_status: ${{ steps.ci1.outputs.status }}
+      repair_ready: ${{ steps.ci1.outputs.repair_ready }}
+      repair_blocked_reason: ${{ steps.ci1.outputs.repair_blocked_reason }}
+      repair_request_artifact_name: ${{ steps.repair_request_input.outputs.artifact_name }}
+      repair_request_artifact_id: ${{ steps.repair_request_upload.outputs.artifact-id }}
+      repair_request_artifact_digest: ${{ steps.repair_request_upload.outputs.artifact-digest }}
+
+    steps:
+      - name: repair 1 subscription 단계 성공 확인
+        shell: bash
+        env:
+          SUBSCRIPTION_RESULT: ${{ needs.subscription1.result }}
+        run: |
+          set -euo pipefail
+          if [ "$SUBSCRIPTION_RESULT" != "success" ]; then
+            echo "repair 1 subscription failed before a raw proposal could exist: subscription1=${SUBSCRIPTION_RESULT}" >&2
+            exit 1
+          fi
+
+      - name: IMPLEMENT raw proposal 다운로드 1
+        uses: actions/download-artifact@v4
+        with:
+          name: bounded-worker-raw-proposal-1-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/worker-output-repair-1
+
+      - name: Trusted validation checkout 1
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+          path: control-validate-1
+
+      - name: Framework runtime layout 준비
+        working-directory: control-validate-1
+        run: |
+          if grep -q '"name": "self-improvement-mvp"' package.json; then
+            mkdir -p .framework-runtime
+            cp package.json package-lock.json .framework-runtime/
+          fi
+
+      - name: Node 설정
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: control-validate-1/.framework-runtime/package-lock.json
+
+      - name: Trusted validation dependencies 설치 1
+        working-directory: control-validate-1
+        run: |
+          npm ci --ignore-scripts --prefix .framework-runtime
+          ln -sT .framework-runtime/node_modules node_modules
+
+      - name: Trusted handoff artifact 재다운로드 1
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.attempt0_result.outputs.source_name }}
+          path: ${{ runner.temp }}/plan-worker-source-validate-1
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.attempt0_result.outputs.source_run_id }}
+
+      - name: Trusted candidate 검증 1
+        working-directory: control-validate-1
+        run: .framework-runtime/node_modules/.bin/tsx src/self-improvement/plan-implement-worker-handler.ts validate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SOURCE_RUN_ID: ${{ needs.attempt0_result.outputs.source_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ needs.attempt0_result.outputs.source_run_attempt }}
+          SOURCE_ARTIFACT_NAME: ${{ needs.attempt0_result.outputs.source_name }}
+          SOURCE_ARTIFACT_ID: ${{ needs.attempt0_result.outputs.source_id }}
+          SOURCE_ARTIFACT_DIGEST: ${{ needs.attempt0_result.outputs.source_digest }}
+          RECOVERY_GUARD_KIND: ${{ needs.attempt0_result.outputs.recovery_guard_kind }}
+          RECOVERY_BASE_SHA: ${{ needs.attempt0_result.outputs.recovery_base_sha }}
+          RECOVERY_CURRENT_SHA: ${{ needs.attempt0_result.outputs.recovery_current_sha }}
+          WORKER_RUN_ID: ${{ github.run_id }}
+          WORKER_RUN_ATTEMPT: ${{ github.run_attempt }}
+          SOURCE_DIRECTORY: ${{ runner.temp }}/plan-worker-source-validate-1
+          RAW_PROPOSAL_PATH: ${{ runner.temp }}/worker-output-repair-1/raw-proposal.json
+          CANDIDATE_OUTPUT_DIRECTORY: ${{ runner.temp }}/validated-candidate-1
+
+      - name: exact base candidate CI checkout 1
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.attempt0_result.outputs.base_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: validation-target-1
+
+      - name: exact base SHA 확인 1
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.attempt0_result.outputs.base_sha }}
+        run: test "$(git -C "$GITHUB_WORKSPACE/validation-target-1" rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: candidate CI dependencies 설치 1
+        working-directory: validation-target-1
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          NODE_AUTH_TOKEN: ""
+          NPM_TOKEN: ""
+        run: npm ci --ignore-scripts
+
+      - name: deterministic CI 및 repair 입력 준비 1
+        id: ci1
+        working-directory: control-validate-1
+        env:
+          SOURCE_DIRECTORY: ${{ runner.temp }}/plan-worker-source-validate-1
+          CANDIDATE_DIRECTORY: ${{ runner.temp }}/validated-candidate-1
+          TARGET_DIRECTORY: ${{ github.workspace }}/validation-target-1
+          OBSERVED_BASE_SHA: ${{ needs.attempt0_result.outputs.base_sha }}
+          STATE_DIRECTORY: ${{ runner.temp }}/worker-ci-1
+          NEXT_REPAIR_ATTEMPT: "2"
+          REPAIR_INPUT_DIRECTORY: ${{ runner.temp }}/repair-input-2
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          NODE_AUTH_TOKEN: ""
+          NPM_TOKEN: ""
+        run: .framework-runtime/node_modules/.bin/tsx src/self-improvement/plan-worker-ci-repair-handler.ts check
+
+      - name: attempt 1 state 정리
+        if: steps.ci1.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/worker-state-1/candidate" "$RUNNER_TEMP/worker-state-1/evidence"
+          if [ -f "$RUNNER_TEMP/validated-candidate-1/candidate.json" ]; then
+            cp "$RUNNER_TEMP/validated-candidate-1/candidate.json" "$RUNNER_TEMP/worker-state-1/candidate/candidate.json"
+            cp "$RUNNER_TEMP/validated-candidate-1/candidate-provenance.json" "$RUNNER_TEMP/worker-state-1/candidate/candidate-provenance.json"
+            cp "$RUNNER_TEMP/worker-ci-1/validation.json" "$RUNNER_TEMP/worker-state-1/evidence/validation-1.json"
+          else
+            # candidate 전에 edit 적용에 실패한 attempt: candidate 없이 trusted 실패 기록만 evidence로 남긴다.
+            cp "$RUNNER_TEMP/worker-ci-1/edit-failure.json" "$RUNNER_TEMP/worker-state-1/evidence/edit-failure-1.json"
+          fi
+
+      - name: attempt 1 state artifact 저장
+        if: steps.ci1.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bounded-worker-state-1-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/worker-state-1
+          if-no-files-found: error
+
+      # repair 2도 같은 Worker run identity를 쓰고 prompt/schema만 trusted repair 입력으로 바꾼다. 새 artifact라 request_id가 다르다.
+      - name: repair 2 IMPLEMENT_REQUEST 기준 identity 다운로드
+        if: steps.ci1.outputs.status == 'FAIL' && steps.ci1.outputs.repair_ready == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.attempt0_result.outputs.request_artifact_name }}
+          path: ${{ runner.temp }}/implement-request-repair-2
+
+      - name: repair 2 IMPLEMENT_REQUEST 입력 고정
+        if: steps.ci1.outputs.status == 'FAIL' && steps.ci1.outputs.repair_ready == 'true'
+        id: repair_request_input
+        shell: bash
+        env:
+          BASE_REQUEST_ARTIFACT_NAME: ${{ needs.attempt0_result.outputs.request_artifact_name }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/implement-request-repair-2"
+          test "$(find "$dir" -mindepth 1 -maxdepth 1 -printf '%y:%f\n' | sort | tr '\n' ' ')" = "f:identity.json f:prompt.md f:schema.json "
+          cp "$RUNNER_TEMP/repair-input-2/prompt.md" "$dir/prompt.md"
+          cp "$RUNNER_TEMP/repair-input-2/schema.json" "$dir/schema.json"
+          echo "artifact_name=${BASE_REQUEST_ARTIFACT_NAME}-repair-2" >> "$GITHUB_OUTPUT"
+
+      - name: repair 2 IMPLEMENT_REQUEST artifact 저장
+        if: steps.ci1.outputs.status == 'FAIL' && steps.ci1.outputs.repair_ready == 'true'
+        id: repair_request_upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.repair_request_input.outputs.artifact_name }}
+          path: ${{ runner.temp }}/implement-request-repair-2
+          if-no-files-found: error
+
+  subscription2:
+    needs: [attempt0_result, repair1]
+    if: "!cancelled() && needs.repair1.outputs.ci_status == 'FAIL' && needs.repair1.outputs.repair_ready == 'true'"
+    permissions:
+      actions: read
+      issues: write
+    uses: ./.github/workflows/subscription-exchange.yml
+    with:
+      kind: IMPLEMENT
+      label: repair 2
+      issue_number: ${{ needs.attempt0_result.outputs.issue_number }}
+      request_artifact_name: ${{ needs.repair1.outputs.repair_request_artifact_name }}
+      request_artifact_id: ${{ needs.repair1.outputs.repair_request_artifact_id }}
+      request_artifact_digest: ${{ needs.repair1.outputs.repair_request_artifact_digest }}
+      result_artifact_name: bounded-worker-raw-proposal-2-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+      result_file_name: raw-proposal.json
+    secrets:
+      EXECUTOR_DISPATCH_TOKEN: ${{ secrets.EXECUTOR_DISPATCH_TOKEN }}
+
+  repair2:
+    needs: [attempt0_result, repair1, subscription2]
+    if: >-
+      !cancelled() &&
+      needs.repair1.outputs.ci_status == 'FAIL' &&
+      needs.repair1.outputs.repair_ready == 'true'
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      ci_status: ${{ steps.ci2.outputs.status }}
+
+    steps:
+      - name: repair 2 subscription 단계 성공 확인
+        shell: bash
+        env:
+          SUBSCRIPTION_RESULT: ${{ needs.subscription2.result }}
+        run: |
+          set -euo pipefail
+          if [ "$SUBSCRIPTION_RESULT" != "success" ]; then
+            echo "repair 2 subscription failed before a raw proposal could exist: subscription2=${SUBSCRIPTION_RESULT}" >&2
+            exit 1
+          fi
+
+      - name: IMPLEMENT raw proposal 다운로드 2
+        uses: actions/download-artifact@v4
+        with:
+          name: bounded-worker-raw-proposal-2-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/worker-output-repair-2
+
+      - name: Trusted validation checkout 2
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+          path: control-validate-2
+
+      - name: Framework runtime layout 준비
+        working-directory: control-validate-2
+        run: |
+          if grep -q '"name": "self-improvement-mvp"' package.json; then
+            mkdir -p .framework-runtime
+            cp package.json package-lock.json .framework-runtime/
+          fi
+
+      - name: Node 설정
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: control-validate-2/.framework-runtime/package-lock.json
+
+      - name: Trusted validation dependencies 설치 2
+        working-directory: control-validate-2
+        run: |
+          npm ci --ignore-scripts --prefix .framework-runtime
+          ln -sT .framework-runtime/node_modules node_modules
+
+      - name: Trusted handoff artifact 재다운로드 2
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.attempt0_result.outputs.source_name }}
+          path: ${{ runner.temp }}/plan-worker-source-validate-2
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.attempt0_result.outputs.source_run_id }}
+
+      - name: Trusted candidate 검증 2
+        working-directory: control-validate-2
+        run: .framework-runtime/node_modules/.bin/tsx src/self-improvement/plan-implement-worker-handler.ts validate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SOURCE_RUN_ID: ${{ needs.attempt0_result.outputs.source_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ needs.attempt0_result.outputs.source_run_attempt }}
+          SOURCE_ARTIFACT_NAME: ${{ needs.attempt0_result.outputs.source_name }}
+          SOURCE_ARTIFACT_ID: ${{ needs.attempt0_result.outputs.source_id }}
+          SOURCE_ARTIFACT_DIGEST: ${{ needs.attempt0_result.outputs.source_digest }}
+          RECOVERY_GUARD_KIND: ${{ needs.attempt0_result.outputs.recovery_guard_kind }}
+          RECOVERY_BASE_SHA: ${{ needs.attempt0_result.outputs.recovery_base_sha }}
+          RECOVERY_CURRENT_SHA: ${{ needs.attempt0_result.outputs.recovery_current_sha }}
+          WORKER_RUN_ID: ${{ github.run_id }}
+          WORKER_RUN_ATTEMPT: ${{ github.run_attempt }}
+          SOURCE_DIRECTORY: ${{ runner.temp }}/plan-worker-source-validate-2
+          RAW_PROPOSAL_PATH: ${{ runner.temp }}/worker-output-repair-2/raw-proposal.json
+          CANDIDATE_OUTPUT_DIRECTORY: ${{ runner.temp }}/validated-candidate-2
+
+      - name: exact base candidate CI checkout 2
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.attempt0_result.outputs.base_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: validation-target-2
+
+      - name: exact base SHA 확인 2
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.attempt0_result.outputs.base_sha }}
+        run: test "$(git -C "$GITHUB_WORKSPACE/validation-target-2" rev-parse HEAD)" = "$EXPECTED_SHA"
+
+      - name: candidate CI dependencies 설치 2
+        working-directory: validation-target-2
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          NODE_AUTH_TOKEN: ""
+          NPM_TOKEN: ""
+        run: npm ci --ignore-scripts
+
+      - name: deterministic CI 최종 검증 2
+        id: ci2
+        working-directory: control-validate-2
+        env:
+          SOURCE_DIRECTORY: ${{ runner.temp }}/plan-worker-source-validate-2
+          CANDIDATE_DIRECTORY: ${{ runner.temp }}/validated-candidate-2
+          TARGET_DIRECTORY: ${{ github.workspace }}/validation-target-2
+          OBSERVED_BASE_SHA: ${{ needs.attempt0_result.outputs.base_sha }}
+          STATE_DIRECTORY: ${{ runner.temp }}/worker-ci-2
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          NODE_AUTH_TOKEN: ""
+          NPM_TOKEN: ""
+        run: .framework-runtime/node_modules/.bin/tsx src/self-improvement/plan-worker-ci-repair-handler.ts check
+
+      - name: attempt 2 state 정리
+        if: steps.ci2.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/worker-state-2/candidate" "$RUNNER_TEMP/worker-state-2/evidence"
+          if [ -f "$RUNNER_TEMP/validated-candidate-2/candidate.json" ]; then
+            cp "$RUNNER_TEMP/validated-candidate-2/candidate.json" "$RUNNER_TEMP/worker-state-2/candidate/candidate.json"
+            cp "$RUNNER_TEMP/validated-candidate-2/candidate-provenance.json" "$RUNNER_TEMP/worker-state-2/candidate/candidate-provenance.json"
+            cp "$RUNNER_TEMP/worker-ci-2/validation.json" "$RUNNER_TEMP/worker-state-2/evidence/validation-2.json"
+          else
+            # candidate 전에 edit 적용에 실패한 attempt: candidate 없이 trusted 실패 기록만 evidence로 남긴다.
+            cp "$RUNNER_TEMP/worker-ci-2/edit-failure.json" "$RUNNER_TEMP/worker-state-2/evidence/edit-failure-2.json"
+          fi
+
+      - name: attempt 2 state artifact 저장
+        if: steps.ci2.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bounded-worker-state-2-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/worker-state-2
+          if-no-files-found: error
+
+  finalize:
+    needs: [attempt0_result, repair1, repair2]
+    if: always() && needs.attempt0_result.outputs.should_run == 'true'
+    permissions:
+      actions: read
+      issues: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: attempt 0 state 다운로드
+        if: needs.attempt0_result.outputs.ci_status != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: bounded-worker-state-0-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/worker-state-0
+
+      - name: attempt 1 state 다운로드
+        if: needs.repair1.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: bounded-worker-state-1-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/worker-state-1
+
+      - name: attempt 2 state 다운로드
+        if: needs.repair2.result == 'success'
+        uses: actions/download-artifact@v4
+        with:
+          name: bounded-worker-state-2-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/worker-state-2
+
+      - name: PASS candidate 선택
+        if: >-
+          needs.attempt0_result.outputs.ci_status == 'PASS' ||
+          needs.repair1.outputs.ci_status == 'PASS' ||
+          needs.repair2.outputs.ci_status == 'PASS'
+        shell: bash
+        env:
+          STATUS0: ${{ needs.attempt0_result.outputs.ci_status }}
+          STATUS1: ${{ needs.repair1.outputs.ci_status }}
+          STATUS2: ${{ needs.repair2.outputs.ci_status }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/final-candidate"
+          if [ "$STATUS0" = "PASS" ]; then
+            SOURCE="$RUNNER_TEMP/worker-state-0/candidate"
+          elif [ "$STATUS1" = "PASS" ]; then
+            SOURCE="$RUNNER_TEMP/worker-state-1/candidate"
+          elif [ "$STATUS2" = "PASS" ]; then
+            SOURCE="$RUNNER_TEMP/worker-state-2/candidate"
+          else
+            echo "no PASS candidate" >&2
+            exit 1
+          fi
+          cp "$SOURCE/candidate.json" "$RUNNER_TEMP/final-candidate/candidate.json"
+          cp "$SOURCE/candidate-provenance.json" "$RUNNER_TEMP/final-candidate/candidate-provenance.json"
+
+      - name: deterministic CI evidence 정리
+        if: needs.attempt0_result.outputs.ci_status != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/worker-ci-evidence"
+          for attempt in 0 1 2; do
+            for name in validation edit-failure; do
+              source="$RUNNER_TEMP/worker-state-${attempt}/evidence/${name}-${attempt}.json"
+              if [ -f "$source" ]; then
+                cp "$source" "$RUNNER_TEMP/worker-ci-evidence/${name}-${attempt}.json"
+              fi
+            done
+          done
+
+      - name: deterministic CI evidence artifact 저장
+        if: needs.attempt0_result.outputs.ci_status != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: bounded-worker-ci-evidence-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/worker-ci-evidence/*.json
+          if-no-files-found: error
+
+      - name: out-of-scope boundary repair 차단 시 fail-closed
+        if: >-
+          (needs.attempt0_result.outputs.ci_status == 'FAIL' &&
+           needs.attempt0_result.outputs.repair_ready == 'false') ||
+          (needs.repair1.outputs.ci_status == 'FAIL' &&
+           needs.repair1.outputs.repair_ready == 'false')
+        shell: bash
+        env:
+          ATTEMPT0_REASON: ${{ needs.attempt0_result.outputs.repair_blocked_reason }}
+          ATTEMPT1_REASON: ${{ needs.repair1.outputs.repair_blocked_reason }}
+        run: |
+          echo "AI repair blocked by deterministic repair policy: attempt0=${ATTEMPT0_REASON}, attempt1=${ATTEMPT1_REASON}" >&2
+          exit 1
+
+      - name: WORKER_INCOMPLETE stalled cycle 기록
+        if: needs.attempt0_result.outputs.worker_incomplete == 'true'
+        uses: actions/github-script@v7
+        env:
+          SOURCE_HANDOFF_RUN_ID: ${{ needs.attempt0_result.outputs.source_run_id }}
+          SOURCE_HANDOFF_RUN_ATTEMPT: ${{ needs.attempt0_result.outputs.source_run_attempt }}
+          SOURCE_HANDOFF_ARTIFACT: ${{ needs.attempt0_result.outputs.source_name }}
+          APPROVED_BASE_SHA: ${{ needs.attempt0_result.outputs.base_sha }}
+          WORKER_RUN_ID: ${{ github.run_id }}
+          WORKER_RUN_ATTEMPT: ${{ github.run_attempt }}
+        with:
+          script: |
+            const artifact = process.env.SOURCE_HANDOFF_ARTIFACT || '';
+            const match = /^plan-implement-handoff-issue-(\d+)-plan-\d+-attempt-\d+-approval-\d+$/.exec(artifact);
+            if (!match) {
+              core.setFailed(`cannot derive issue from Handoff artifact: ${artifact}`);
+              return;
+            }
+            const issueNumber = Number(match[1]);
+            const handoffRunId = Number(process.env.SOURCE_HANDOFF_RUN_ID);
+            const handoffRunAttempt = Number(process.env.SOURCE_HANDOFF_RUN_ATTEMPT);
+            const workerRunId = Number(process.env.WORKER_RUN_ID);
+            const workerRunAttempt = Number(process.env.WORKER_RUN_ATTEMPT);
+            const baseSha = process.env.APPROVED_BASE_SHA || '';
+            if (
+              ![issueNumber, handoffRunId, handoffRunAttempt, workerRunId, workerRunAttempt]
+                .every((value) => Number.isSafeInteger(value) && value > 0) ||
+              !/^[0-9a-f]{40,64}$/.test(baseSha)
+            ) {
+              core.setFailed('invalid stalled cycle identity');
+              return;
+            }
+            const marker =
+              `<!-- ai-dev-framework:STALLED_WORKER issue=${issueNumber} handoff-run=${handoffRunId} handoff-attempt=${handoffRunAttempt} artifact=${artifact} base-sha=${baseSha} worker-run=${workerRunId} worker-attempt=${workerRunAttempt} reason=WORKER_INCOMPLETE -->`;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo,
+              issue_number: issueNumber,
+              per_page: 100,
+            });
+            if (comments.some((comment) => (comment.body || '').includes(marker))) {
+              core.info('exact WORKER_INCOMPLETE marker already exists');
+              return;
+            }
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: issueNumber,
+              body: [
+                marker,
+                '## Worker 중단 — WORKER_INCOMPLETE',
+                'AI Worker가 승인 범위 전체를 완전한 candidate로 만들지 못했다고 명시했습니다.',
+                '인프라 장애가 아니므로 자동 Recovery 대상으로 분류하지 않습니다. 범위를 보완하거나 다시 PLAN/IMPLEMENT할지 사람이 판단하세요.',
+              ].join('\n\n'),
+            });
+
+      - name: WORKER_INCOMPLETE 시 fail-closed
+        if: needs.attempt0_result.outputs.worker_incomplete == 'true'
+        shell: bash
+        run: |
+          echo "PLAN Worker returned complete=false; stopped as WORKER_INCOMPLETE" >&2
+          exit 1
+
+      - name: INFRA_FAILURE stalled cycle 기록
+        if: needs.attempt0_result.outputs.infrastructure_failed == 'true'
+        uses: actions/github-script@v7
+        env:
+          SOURCE_HANDOFF_RUN_ID: ${{ needs.attempt0_result.outputs.source_run_id }}
+          SOURCE_HANDOFF_RUN_ATTEMPT: ${{ needs.attempt0_result.outputs.source_run_attempt }}
+          SOURCE_HANDOFF_ARTIFACT: ${{ needs.attempt0_result.outputs.source_name }}
+          APPROVED_BASE_SHA: ${{ needs.attempt0_result.outputs.base_sha }}
+          WORKER_RUN_ID: ${{ github.run_id }}
+          WORKER_RUN_ATTEMPT: ${{ github.run_attempt }}
+        with:
+          script: |
+            const artifact = process.env.SOURCE_HANDOFF_ARTIFACT || '';
+            const match = /^plan-implement-handoff-issue-(\d+)-plan-\d+-attempt-\d+-approval-\d+$/.exec(artifact);
+            if (!match) {
+              core.setFailed(`cannot derive issue from Handoff artifact: ${artifact}`);
+              return;
+            }
+
+            const issueNumber = Number(match[1]);
+            const handoffRunId = Number(process.env.SOURCE_HANDOFF_RUN_ID);
+            const handoffRunAttempt = Number(process.env.SOURCE_HANDOFF_RUN_ATTEMPT);
+            const workerRunId = Number(process.env.WORKER_RUN_ID);
+            const workerRunAttempt = Number(process.env.WORKER_RUN_ATTEMPT);
+            const baseSha = process.env.APPROVED_BASE_SHA || '';
+            if (
+              ![issueNumber, handoffRunId, handoffRunAttempt, workerRunId, workerRunAttempt]
+                .every((value) => Number.isSafeInteger(value) && value > 0) ||
+              !/^[0-9a-f]{40,64}$/.test(baseSha)
+            ) {
+              core.setFailed('invalid stalled cycle identity');
+              return;
+            }
+
+            const marker =
+              `<!-- ai-dev-framework:STALLED_WORKER issue=${issueNumber} handoff-run=${handoffRunId} handoff-attempt=${handoffRunAttempt} artifact=${artifact} base-sha=${baseSha} worker-run=${workerRunId} worker-attempt=${workerRunAttempt} reason=INFRA_FAILURE -->`;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo,
+              issue_number: issueNumber,
+              per_page: 100,
+            });
+            if (comments.some((comment) => (comment.body || '').includes(marker))) {
+              core.info('exact STALLED_WORKER marker already exists');
+              return;
+            }
+
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: issueNumber,
+              body: [
+                marker,
+                '## Worker 일시 중단 — INFRA_FAILURE',
+                '업무 candidate가 생성되기 전에 infrastructure failure로 중단되었습니다.',
+                'Trusted Recovery Preflight가 PASS하면 Worker가 자동 재진입합니다.',
+              ].join('\n\n'),
+            });
+
+      - name: upstream infrastructure failure 시 fail-closed
+        if: >-
+          needs.attempt0_result.outputs.infrastructure_failed == 'true' ||
+          needs.repair1.result == 'failure' ||
+          needs.repair2.result == 'failure'
+        shell: bash
+        run: |
+          echo "bounded Worker attempt job failed before a trusted PASS candidate was produced" >&2
+          exit 1
+
+      - name: bounded repair 소진 시 fail-closed
+        if: >-
+          needs.attempt0_result.outputs.ci_status == 'FAIL' &&
+          needs.repair1.outputs.ci_status == 'FAIL' &&
+          needs.repair2.outputs.ci_status == 'FAIL'
+        shell: bash
+        run: |
+          echo "deterministic CI or exact-base edit application failed after two bounded repairs" >&2
+          exit 1
+
+      - name: Validated candidate artifact 저장
+        if: >-
+          needs.attempt0_result.outputs.ci_status == 'PASS' ||
+          needs.repair1.outputs.ci_status == 'PASS' ||
+          needs.repair2.outputs.ci_status == 'PASS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.attempt0_result.outputs.candidate_artifact_name }}
+          path: |
+            ${{ runner.temp }}/final-candidate/candidate.json
+            ${{ runner.temp }}/final-candidate/candidate-provenance.json
+          if-no-files-found: error

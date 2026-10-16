@@ -1,0 +1,666 @@
+name: Read-only AI PLAN
+
+on:
+  issues:
+    types: [opened, reopened]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 업무 요구를 작성한 Issue 번호
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  plan:
+    if: >-
+      (github.event_name == 'workflow_dispatch' &&
+       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) ||
+      (github.event_name == 'issues' &&
+       startsWith(github.event.issue.title, '[업무 요구]') &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association))
+    outputs:
+      identity: ${{ steps.input.outputs.identity }}
+      planner_model: ${{ steps.input.outputs.planner_model }}
+      request_artifact_id: ${{ steps.request_upload.outputs.artifact-id }}
+      request_artifact_digest: ${{ steps.request_upload.outputs.artifact-digest }}
+      request_artifact_url: ${{ steps.request_upload.outputs.artifact-url }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: read
+    env:
+      GH_TOKEN: ""
+      GITHUB_TOKEN: ""
+      GIT_OPTIONAL_LOCKS: "0"
+    steps:
+      - name: Framework checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          path: planner-control
+
+      - name: Framework runtime layout 준비
+        working-directory: planner-control
+        run: |
+          if grep -q '"name": "self-improvement-mvp"' package.json; then
+            mkdir -p .framework-runtime
+            cp package.json package-lock.json .framework-runtime/
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Framework dependencies
+        working-directory: planner-control
+        run: |
+          npm ci --ignore-scripts --prefix .framework-runtime
+          ln -sT .framework-runtime/node_modules node_modules
+
+      - name: Freeze user requirement and target SHA
+        id: input
+        uses: actions/github-script@v7
+        env:
+          ISSUE_NUMBER: ${{ github.event_name == 'issues' && github.event.issue.number || inputs.issue_number }}
+          PLAN_INGRESS_EVENT: ${{ github.event_name }}
+          PLAN_INGRESS_ACTOR: ${{ github.actor }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const path = require('node:path');
+            const { createHash } = require('node:crypto');
+            const raw = process.env.ISSUE_NUMBER;
+            if (!/^[1-9]\d*$/.test(raw) || !Number.isSafeInteger(Number(raw))) throw new Error('Invalid issue number');
+            const { data: issue } = await github.rest.issues.get({ ...context.repo, issue_number: Number(raw) });
+            if (issue.pull_request || !issue.body?.trim()) throw new Error('A requirement Issue with a body is required');
+            // Requirement source는 provenance다. 어디서 왔든 이후 lifecycle은 하나이며, 여기서는 기록만 한다.
+            // - HUMAN: 사람이 만든 Issue (issues 이벤트는 workflow if의 author association gate를 통과한 뒤에만 도달한다)
+            // - PRODUCT_EVALUATION: Trusted Product Evaluation이 남긴 PRODUCT_IMPROVEMENT marker가 있는 Issue
+            //   (Product Discovery marker와, 머지 후 자동 평가 시절의 cycle marker를 모두 읽는다)
+            // - OTHER_TRUSTED_SOURCE: 그 외 자동화가 만든 Issue (trusted dispatch로만 PLAN에 도달한다)
+            const ingressEvent = process.env.PLAN_INGRESS_EVENT;
+            if (ingressEvent !== 'issues' && ingressEvent !== 'workflow_dispatch') throw new Error(`Unsupported PLAN ingress event: ${ingressEvent}`);
+            const marker = /<!-- ai-dev-framework:PRODUCT_IMPROVEMENT (?:cycle-issue=([1-9]\d*) cycle-pr=([1-9]\d*)|discovery-issue=([1-9]\d*) discovery-run=([1-9]\d*)) snapshot=([0-9a-f]{64}) -->/.exec(issue.body);
+            const author = { login: issue.user?.login ?? null, id: issue.user?.id ?? null, type: issue.user?.type ?? null, association: issue.author_association ?? null };
+            const source = {
+              kind: marker ? 'PRODUCT_EVALUATION' : author.type === 'User' ? 'HUMAN' : 'OTHER_TRUSTED_SOURCE',
+              ingress: ingressEvent,
+              trust: ingressEvent === 'issues'
+                ? { level: 'VERIFIED', by: 'issue-author-association', association: author.association }
+                : { level: 'VERIFIED', by: 'workflow-dispatch-authority', dispatchedBy: process.env.PLAN_INGRESS_ACTOR || null },
+              author,
+              ...(marker ? {
+                productImprovement: marker[1]
+                  ? { cycleIssue: Number(marker[1]), cyclePullRequest: Number(marker[2]), snapshotDigest: marker[5] }
+                  : { discoveryIssue: Number(marker[3]), discoveryRun: Number(marker[4]), snapshotDigest: marker[5] },
+              } : {}),
+            };
+            const { data: repo } = await github.rest.repos.get(context.repo);
+            const { data: commit } = await github.rest.repos.getCommit({ ...context.repo, ref: repo.default_branch });
+            const output = path.join(process.env.RUNNER_TEMP, 'ai-plan');
+            fs.mkdirSync(output);
+            fs.mkdirSync(path.join(process.env.RUNNER_TEMP, 'plan-neutral'));
+            fs.writeFileSync(path.join(output, 'requirement.md'), `${issue.title}\n\n${issue.body}`);
+            const identity = {
+              schemaVersion: 1,
+              requirement: {
+                issueNumber: issue.number,
+                digestAlgorithm: 'sha256',
+                digestEncoding: 'UTF-8 JSON.stringify([title, body])',
+                digest: createHash('sha256').update(JSON.stringify([issue.title, issue.body]), 'utf8').digest('hex'),
+              },
+              repository: `${context.repo.owner}/${context.repo.repo}`,
+              targetSha: commit.sha,
+              source,
+              workflow: { runId: process.env.GITHUB_RUN_ID, runAttempt: process.env.GITHUB_RUN_ATTEMPT, sha: context.sha },
+              artifactName: `plan-issue-${issue.number}-${process.env.GITHUB_RUN_ID}-attempt-${process.env.GITHUB_RUN_ATTEMPT}`,
+            };
+            fs.writeFileSync(path.join(output, 'identity.json'), JSON.stringify(identity, null, 2));
+            core.setOutput('identity', JSON.stringify(identity));
+            core.setOutput('sha', commit.sha);
+            // PLAN 기본 모델은 sonnet이다 (#344). 사람이 Issue 템플릿의 "복잡한 요구" 체크박스를 체크한
+            // 요구만 opus를 쓴다. 체크 여부는 본문에 있으므로 requirement digest와 provenance에 그대로 남는다.
+            // Product Evaluation 후보처럼 사람이 쓰지 않은 본문(source.kind !== 'HUMAN')은 체크박스가 있어도 올리지 않는다.
+            const complexRequirement = /^[ \t]*[-*][ \t]+\[[xX]\][ \t]+복잡한 요구입니다/m.test(issue.body);
+            core.setOutput('planner_model', source.kind === 'HUMAN' && complexRequirement ? 'opus' : 'sonnet');
+
+      - name: Target checkout at frozen SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.input.outputs.sha }}
+          persist-credentials: false
+          path: plan-target
+
+      - name: Prepare bounded PLAN Context Pack
+        working-directory: planner-control
+        run: .framework-runtime/node_modules/.bin/tsx src/self-improvement/planner-handler.ts prepare
+        env:
+          PLAN_TARGET: ${{ github.workspace }}/plan-target
+          PLAN_OUTPUT: ${{ runner.temp }}/ai-plan
+          PLAN_REQUIREMENT: ${{ runner.temp }}/ai-plan/requirement.md
+          PLAN_REPOSITORY: ${{ github.repository }}
+          PLAN_SHA: ${{ steps.input.outputs.sha }}
+
+      - name: Remove repository checkouts after trusted prepare
+        run: |
+          rm -rf planner-control plan-target
+          test ! -e planner-control
+          test ! -e plan-target
+
+      - name: PLAN request rerun 상한 확인
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_RUN_ATTEMPT" -gt 2 ]; then
+            echo "PLAN request guardrail: 동일 PLAN run은 최대 2 attempts만 허용합니다." >&2
+            exit 1
+          fi
+
+      - name: Store bounded PLAN request
+        id: request_upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJSON(steps.input.outputs.identity).artifactName }}-request
+          path: |
+            ${{ runner.temp }}/ai-plan/input.json
+            ${{ runner.temp }}/ai-plan/PLAN-context.json
+            ${{ runner.temp }}/ai-plan/prompt.md
+            ${{ runner.temp }}/ai-plan/schema.json
+            ${{ runner.temp }}/ai-plan/identity.json
+          if-no-files-found: error
+
+  request:
+    needs: plan
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    outputs:
+      request_id: ${{ steps.request.outputs.request_id }}
+      request_comment_id: ${{ steps.request.outputs.request_comment_id }}
+    steps:
+      - name: Leave bounded PLAN request on requirement Issue
+        id: request
+        uses: actions/github-script@v7
+        env:
+          PLAN_IDENTITY: ${{ needs.plan.outputs.identity }}
+          PLAN_MODEL: ${{ needs.plan.outputs.planner_model }}
+          REQUEST_ARTIFACT_ID: ${{ needs.plan.outputs.request_artifact_id }}
+          REQUEST_ARTIFACT_DIGEST: ${{ needs.plan.outputs.request_artifact_digest }}
+          REQUEST_ARTIFACT_URL: ${{ needs.plan.outputs.request_artifact_url }}
+        with:
+          script: |
+            const { createHash } = require('node:crypto');
+            const identity = JSON.parse(process.env.PLAN_IDENTITY);
+            const model = process.env.PLAN_MODEL;
+            const artifactId = process.env.REQUEST_ARTIFACT_ID;
+            const artifactDigest = process.env.REQUEST_ARTIFACT_DIGEST;
+            if (!['opus', 'sonnet'].includes(model)) throw new Error('Unsupported subscription PLAN model');
+            if (!/^[1-9]\d*$/.test(artifactId) || !/^[0-9a-f]{64}$/.test(artifactDigest)) {
+              throw new Error('Missing exact PLAN request artifact identity');
+            }
+            const requestId = createHash('sha256').update(JSON.stringify([
+              identity.repository,
+              identity.requirement.issueNumber,
+              identity.targetSha,
+              identity.requirement.digest,
+              model,
+              Number(identity.workflow.runId),
+              Number(identity.workflow.runAttempt),
+              Number(artifactId),
+              artifactDigest,
+            ]), 'utf8').digest('hex');
+            core.setOutput('request_id', requestId);
+            const prefix = `<!-- ai-dev-framework:PLAN_REQUEST v=1 request=${requestId} `;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo,
+              issue_number: identity.requirement.issueNumber,
+              per_page: 100,
+            });
+            const existing = comments.find((comment) =>
+              comment.user?.login === 'github-actions[bot]' &&
+              typeof comment.body === 'string' &&
+              comment.body.includes(prefix)
+            );
+            if (existing) {
+              core.setOutput('request_comment_id', String(existing.id));
+              core.info('Identical PLAN request is already queued; reusing it.');
+              return;
+            }
+            const marker = [
+              `<!-- ai-dev-framework:PLAN_REQUEST v=1 request=${requestId}`,
+              `issue=${identity.requirement.issueNumber}`,
+              `repository=${identity.repository}`,
+              `target=${identity.targetSha}`,
+              `requirement=${identity.requirement.digest}`,
+              `run=${identity.workflow.runId}`,
+              `attempt=${identity.workflow.runAttempt}`,
+              `artifact=${artifactId}`,
+              `digest=${artifactDigest}`,
+              `model=${model} -->`,
+            ].join(' ');
+            const body = [
+              marker,
+              '## PLAN 실행 요청 대기',
+              `Request: \`${requestId}\``,
+              `Bounded request artifact: [${identity.artifactName}-request](${process.env.REQUEST_ARTIFACT_URL})`,
+              `Frozen target SHA: \`${identity.targetSha}\``,
+              `Model class: \`${model}\``,
+              'Private subscription executor가 이 bounded prompt/schema만 사용해 PLAN을 생성합니다.',
+              'Public repository에는 Claude/ChatGPT 구독 자격증명이 없습니다. Executor wake-up credential은 private repo Actions dispatch-only로 제한됩니다.',
+              '### HumanStatus: PLAN_REQUEST',
+              '**현재 상황:** PLAN 입력은 trusted prepare까지 끝났고 subscription executor의 결과를 기다리고 있습니다.',
+              '**다음 행동:** 자동 실행을 기다리세요. 사람이 Claude 세션을 시작할 필요는 없습니다.',
+            ].join('\n\n');
+            const { data: comment } = await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: identity.requirement.issueNumber,
+              body,
+            });
+            core.setOutput('request_comment_id', String(comment.id));
+
+      - name: Wake private subscription executor
+        env:
+          EXECUTOR_DISPATCH_TOKEN: ${{ secrets.EXECUTOR_DISPATCH_TOKEN }}
+          PLAN_REQUEST_ID: ${{ steps.request.outputs.request_id }}
+          PLAN_REPOSITORY: ${{ github.repository }}
+          # 이 repository의 AI 호출을 처리할 executor. 팀마다 자기 구독 runner로 도는 executor repo를 변수로 정한다.
+          AI_EXECUTOR_REPOSITORY: ${{ vars.AI_EXECUTOR_REPOSITORY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${EXECUTOR_DISPATCH_TOKEN:-}" ]; then
+            echo "Missing EXECUTOR_DISPATCH_TOKEN (fine-grained token: AI_EXECUTOR_REPOSITORY / Actions: write)." >&2
+            exit 1
+          fi
+          if [[ ! "${AI_EXECUTOR_REPOSITORY:-}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "Missing or invalid AI_EXECUTOR_REPOSITORY variable (owner/repo of this repository's subscription executor)." >&2
+            exit 1
+          fi
+          if [[ ! "$PLAN_REQUEST_ID" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Invalid PLAN_REQUEST_ID; refusing executor dispatch." >&2
+            exit 1
+          fi
+          if [[ ! "$PLAN_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "Invalid PLAN_REPOSITORY; refusing executor dispatch." >&2
+            exit 1
+          fi
+          curl -fsS -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $EXECUTOR_DISPATCH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${AI_EXECUTOR_REPOSITORY}/actions/workflows/plan-poller.yml/dispatches" \
+            -d "{\"ref\":\"main\",\"inputs\":{\"request_id\":\"$PLAN_REQUEST_ID\",\"repository\":\"$PLAN_REPOSITORY\"}}"
+
+  resolve:
+    needs: [plan, request]
+    runs-on: ubuntu-latest
+    # executor의 격리 읽기 도구 PLAN(step 상한 10분, #375)까지 기다린다. 대기 loop는 15분이다.
+    timeout-minutes: 18
+    permissions:
+      contents: read
+      actions: read
+      issues: read
+    outputs:
+      identity: ${{ steps.request_identity.outputs.identity }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      artifact_url: ${{ steps.upload.outputs.artifact-url }}
+      decision_packet: ${{ steps.validate.outputs.decision_packet }}
+      plan_ready: ${{ steps.validate.outputs.plan_ready }}
+      request_id: ${{ needs.request.outputs.request_id }}
+      failure_reason: ${{ steps.validate.outputs.failure_reason }}
+      executor_failure_reason: ${{ steps.wait.outputs.executor_failure_reason }}
+    steps:
+      - name: Wait for subscription PLAN result
+        id: wait
+        uses: actions/github-script@v7
+        env:
+          PLAN_IDENTITY: ${{ needs.plan.outputs.identity }}
+          PLAN_MODEL: ${{ needs.plan.outputs.planner_model }}
+          REQUEST_ID: ${{ needs.request.outputs.request_id }}
+          REQUEST_COMMENT_ID: ${{ needs.request.outputs.request_comment_id }}
+          REQUEST_ARTIFACT_ID: ${{ needs.plan.outputs.request_artifact_id }}
+          REQUEST_ARTIFACT_DIGEST: ${{ needs.plan.outputs.request_artifact_digest }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const path = require('node:path');
+            const zlib = require('node:zlib');
+            const identity = JSON.parse(process.env.PLAN_IDENTITY);
+            const requestId = process.env.REQUEST_ID;
+            const model = process.env.PLAN_MODEL;
+            const requestCommentId = Number(process.env.REQUEST_COMMENT_ID);
+            if (!/^[0-9a-f]{64}$/.test(requestId) || !Number.isSafeInteger(requestCommentId)) {
+              throw new Error('Invalid PLAN request identity');
+            }
+            const markerPrefix = [
+              '<!-- ai-dev-framework:PLAN_RESULT v=1',
+              `request=${requestId}`,
+              `issue=${identity.requirement.issueNumber}`,
+              `repository=${identity.repository}`,
+              `target=${identity.targetSha}`,
+              `requirement=${identity.requirement.digest}`,
+            ].join(' ');
+            const resultPattern = /<!-- ai-dev-framework:PLAN_RESULT v=1 request=([0-9a-f]{64}) issue=([1-9]\d*) repository=([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+) target=([0-9a-f]{40}) requirement=([0-9a-f]{64}) run=([1-9]\d*) attempt=([1-9]\d*) artifact=([1-9]\d*) digest=([0-9a-f]{64}) model=(opus|sonnet)(?: tools=(read))? encoding=gzip-base64 -->/;
+            // executor가 요청을 처리하지 못했다는 신호다(Private failure_notice.py). PLAN_RESULT와 같은 identity 필드에
+            // 사유만 붙고 tools=read는 붙지 않는다. 결과가 아니므로 이것을 보면 15분을 기다리지 않고 멈출 뿐이다.
+            const failureReasons = ['REQUEST_REJECTED', 'EXECUTION_FAILED', 'RESULT_POST_FAILED'];
+            const failureFields = [
+              `request=${requestId}`,
+              `issue=${identity.requirement.issueNumber}`,
+              `repository=${identity.repository}`,
+              `target=${identity.targetSha}`,
+              `requirement=${identity.requirement.digest}`,
+              `run=${identity.workflow.runId}`,
+              `attempt=${identity.workflow.runAttempt}`,
+              `artifact=${process.env.REQUEST_ARTIFACT_ID}`,
+              `digest=${process.env.REQUEST_ARTIFACT_DIGEST}`,
+              `model=${model}`,
+            ].join(' ');
+            const failurePrefix = `<!-- ai-dev-framework:PLAN_FAILED v=1 request=${requestId} `;
+            for (let poll = 0; poll < 90; poll += 1) {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                ...context.repo,
+                issue_number: identity.requirement.issueNumber,
+                per_page: 100,
+              });
+              const owned = comments
+                .filter((comment) => Number(comment.id) > requestCommentId)
+                .filter((comment) =>
+                  comment.author_association === 'OWNER' &&
+                  comment.user?.type === 'User' &&
+                  comment.user?.login === context.repo.owner
+                );
+              // FAILED는 PLAN_RESULT보다 먼저 본다. executor job 재실행으로 여러 번 올라와도 멈춘다는 뜻은 같다.
+              const failures = owned.filter((comment) => typeof comment.body === 'string' && comment.body.includes(failurePrefix));
+              if (failures.length > 0) {
+                const marker = failures[0].body.split(/\r?\n/)[0];
+                const reason = failureReasons.find((value) => marker === `<!-- ai-dev-framework:PLAN_FAILED v=1 ${failureFields} reason=${value} -->`);
+                if (!reason) throw new Error('PLAN_FAILED identity mismatch');
+                core.setOutput('executor_failure_reason', reason);
+                throw new Error(`Private subscription executor reported PLAN_FAILED reason=${reason} (comment ${failures[0].id})`);
+              }
+              const result = comments
+                .filter((comment) => Number(comment.id) > requestCommentId)
+                .filter((comment) =>
+                  comment.author_association === 'OWNER' &&
+                  comment.user?.type === 'User' &&
+                  comment.user?.login === context.repo.owner
+                )
+                .find((comment) => typeof comment.body === 'string' && comment.body.includes(markerPrefix));
+              if (result) {
+                const match = resultPattern.exec(result.body);
+                if (!match) throw new Error('Malformed PLAN_RESULT marker');
+                if (match[1] !== requestId ||
+                    Number(match[2]) !== identity.requirement.issueNumber ||
+                    match[3] !== identity.repository ||
+                    match[4] !== identity.targetSha ||
+                    match[5] !== identity.requirement.digest ||
+                    Number(match[6]) !== Number(identity.workflow.runId) ||
+                    Number(match[7]) !== Number(identity.workflow.runAttempt) ||
+                    Number(match[8]) !== Number(process.env.REQUEST_ARTIFACT_ID) ||
+                    match[9] !== process.env.REQUEST_ARTIFACT_DIGEST ||
+                    match[10] !== model) {
+                  throw new Error('PLAN_RESULT identity mismatch');
+                }
+                const payload = /PLAN_RESULT_GZIP_BASE64:\s*([A-Za-z0-9+/=]+)/.exec(result.body)?.[1];
+                if (!payload) throw new Error('Missing PLAN_RESULT payload');
+                const raw = zlib.gunzipSync(Buffer.from(payload, 'base64')).toString('utf8');
+                JSON.parse(raw);
+                const output = path.join(process.env.RUNNER_TEMP, 'plan-result');
+                fs.mkdirSync(output, { recursive: true });
+                fs.writeFileSync(path.join(output, 'raw-plan.json'), raw);
+                // executor가 격리 읽기 도구로 실행한 결과에만 tools=read를 붙인다. 이 값만 Pack 밖 근거를 허용한다(#375).
+                core.setOutput('read_tools', match[11] === 'read' ? 'true' : 'false');
+                core.info(`Received PLAN_RESULT comment ${result.id} (read tools: ${match[11] === 'read'})`);
+                return;
+              }
+              await new Promise((resolve) => setTimeout(resolve, 10_000));
+            }
+            throw new Error('Timed out waiting for private subscription executor PLAN_RESULT');
+
+      - name: Download bounded PLAN request
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ fromJSON(needs.plan.outputs.identity).artifactName }}-request
+          path: ${{ runner.temp }}/ai-plan
+
+      - name: Bind request artifact to this exact PLAN run
+        id: request_identity
+        shell: bash
+        env:
+          PLAN_IDENTITY_JSON: ${{ needs.plan.outputs.identity }}
+          PLAN_MODEL: ${{ needs.plan.outputs.planner_model }}
+          REQUEST_ID: ${{ needs.request.outputs.request_id }}
+          REQUEST_ARTIFACT_ID: ${{ needs.plan.outputs.request_artifact_id }}
+          REQUEST_ARTIFACT_DIGEST: ${{ needs.plan.outputs.request_artifact_digest }}
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/plan-result/raw-plan.json" "$RUNNER_TEMP/ai-plan/raw-plan.json"
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { createHash } = require('node:crypto');
+          const expected = JSON.parse(process.env.PLAN_IDENTITY_JSON);
+          const actual = JSON.parse(fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'ai-plan', 'identity.json'), 'utf8'));
+          if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error('PLAN request identity changed');
+          if (String(actual.workflow.runId) !== process.env.GITHUB_RUN_ID ||
+              String(actual.workflow.runAttempt) !== process.env.GITHUB_RUN_ATTEMPT ||
+              actual.workflow.sha !== process.env.GITHUB_SHA) {
+            throw new Error('PLAN request is not bound to this exact workflow run');
+          }
+          const requestId = createHash('sha256').update(JSON.stringify([
+            actual.repository,
+            actual.requirement.issueNumber,
+            actual.targetSha,
+            actual.requirement.digest,
+            process.env.PLAN_MODEL,
+            Number(actual.workflow.runId),
+            Number(actual.workflow.runAttempt),
+            Number(process.env.REQUEST_ARTIFACT_ID),
+            process.env.REQUEST_ARTIFACT_DIGEST,
+          ]), 'utf8').digest('hex');
+          if (requestId !== process.env.REQUEST_ID) throw new Error('PLAN request digest mismatch');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `sha=${actual.targetSha}\ncontrol_sha=${actual.workflow.sha}\nidentity=${JSON.stringify(actual)}\n`);
+          NODE
+
+      - name: Fresh Framework checkout for trusted validation
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.request_identity.outputs.control_sha }}
+          persist-credentials: false
+          path: planner-control-validation
+
+      - name: Framework runtime layout 준비
+        working-directory: planner-control-validation
+        run: |
+          if grep -q '"name": "self-improvement-mvp"' package.json; then
+            mkdir -p .framework-runtime
+            cp package.json package-lock.json .framework-runtime/
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Fresh Target checkout at frozen SHA for validation
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.request_identity.outputs.sha }}
+          persist-credentials: false
+          path: plan-target-validation
+
+      - name: Install Framework dependencies for validation
+        working-directory: planner-control-validation
+        run: |
+          npm ci --ignore-scripts --prefix .framework-runtime
+          ln -sT .framework-runtime/node_modules node_modules
+
+      - name: Validate bounded PLAN against fresh exact SHA
+        id: validate
+        working-directory: planner-control-validation
+        # 검증 실패 사유의 첫 Error 줄을 남겨 failure notice job이 Issue에 알린다. 실패 판정은 그대로다.
+        run: |
+          status=0
+          .framework-runtime/node_modules/.bin/tsx src/self-improvement/planner-handler.ts artifact 2> "$RUNNER_TEMP/plan-validate.err" || status=$?
+          cat "$RUNNER_TEMP/plan-validate.err" >&2
+          if [ "$status" -ne 0 ]; then
+            reason="$(grep -m1 -E '^Error: ' "$RUNNER_TEMP/plan-validate.err" | cut -c1-300 || true)"
+            echo "failure_reason=$reason" >> "$GITHUB_OUTPUT"
+            exit "$status"
+          fi
+        env:
+          PLAN_TARGET: ${{ github.workspace }}/plan-target-validation
+          PLAN_OUTPUT: ${{ runner.temp }}/ai-plan
+          PLAN_EXECUTOR_READ_TOOLS: ${{ steps.wait.outputs.read_tools }}
+
+      - name: Store PLAN only
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJSON(steps.request_identity.outputs.identity).artifactName }}
+          path: |
+            ${{ runner.temp }}/ai-plan/PLAN.json
+            ${{ runner.temp }}/ai-plan/PLAN.md
+            ${{ runner.temp }}/ai-plan/PLAN-context.json
+            ${{ runner.temp }}/ai-plan/identity.json
+          if-no-files-found: error
+
+
+  provenance:
+    needs: resolve
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Bind uploaded PLAN to frozen provenance
+        id: provenance
+        uses: actions/github-script@v7
+        env:
+          PLAN_IDENTITY: ${{ needs.resolve.outputs.identity }}
+          PLAN_ARTIFACT_ID: ${{ needs.resolve.outputs.artifact_id }}
+          PLAN_ARTIFACT_DIGEST: ${{ needs.resolve.outputs.artifact_digest }}
+          PLAN_ARTIFACT_URL: ${{ needs.resolve.outputs.artifact_url }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const path = require('node:path');
+            const identity = JSON.parse(process.env.PLAN_IDENTITY);
+            const id = process.env.PLAN_ARTIFACT_ID;
+            const digest = process.env.PLAN_ARTIFACT_DIGEST;
+            if (!/^[1-9]\d*$/.test(id) || !/^[a-f0-9]{64}$/.test(digest)) throw new Error('Missing exact uploaded PLAN identity');
+            const provenance = {
+              ...identity,
+              kind: 'untrusted-plan-provenance',
+              artifact: { name: identity.artifactName, id, digestAlgorithm: 'sha256', digest, url: process.env.PLAN_ARTIFACT_URL },
+            };
+            const file = path.join(process.env.RUNNER_TEMP, 'PLAN-provenance.json');
+            fs.writeFileSync(file, JSON.stringify(provenance, null, 2));
+            core.setOutput('path', file);
+
+      - name: Store trusted provenance
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ fromJSON(needs.resolve.outputs.identity).artifactName }}-provenance
+          path: ${{ steps.provenance.outputs.path }}
+          if-no-files-found: error
+
+      - name: Leave human-readable PLAN pointer on requirement Issue
+        uses: actions/github-script@v7
+        env:
+          PLAN_IDENTITY: ${{ needs.resolve.outputs.identity }}
+          PLAN_ARTIFACT_ID: ${{ needs.resolve.outputs.artifact_id }}
+          PLAN_ARTIFACT_DIGEST: ${{ needs.resolve.outputs.artifact_digest }}
+          PLAN_ARTIFACT_URL: ${{ needs.resolve.outputs.artifact_url }}
+          PROVENANCE_URL: ${{ steps.upload.outputs.artifact-url }}
+          PLAN_DECISION_PACKET: ${{ needs.resolve.outputs.decision_packet }}
+          PLAN_READY: ${{ needs.resolve.outputs.plan_ready }}
+          PLAN_REQUEST_ID: ${{ needs.resolve.outputs.request_id }}
+        with:
+          script: |
+            const identity = JSON.parse(process.env.PLAN_IDENTITY);
+            const decisionPacket = process.env.PLAN_DECISION_PACKET ?? '';
+            const planReady = process.env.PLAN_READY;
+            if (!decisionPacket.trim().startsWith('### PLAN Decision Packet') || (planReady !== 'true' && planReady !== 'false')) {
+              throw new Error('Missing PLAN Decision Packet; refusing to post a PLAN pointer without human decision material');
+            }
+            const nextAction = planReady === 'true'
+              ? '위 PLAN Decision Packet을 읽고 이 계획으로 문제를 해결하도록 허용할지 결정하세요. 허용하면 정확히 `PLAN-승인` 댓글을 남기고, 아니면 사유를 남기고 Issue를 닫거나 요구사항을 보완한 뒤 재PLAN하세요.'
+              : '이 PLAN은 승인할 수 없습니다. Blocking Question에 답하도록 Issue 본문을 보완한 뒤 PLAN을 다시 받거나, 사유를 남기고 Issue를 닫으세요. `PLAN-승인`을 남겨도 fail-closed로 거부됩니다.';
+            const body = [
+              '## PLAN (AI 제안 — 구현 승인 아님)',
+              `PLAN: [${identity.artifactName}](${process.env.PLAN_ARTIFACT_URL})`,
+              `Provenance: [PLAN-provenance.json](${process.env.PROVENANCE_URL})`,
+              `Subscription request: \`${process.env.PLAN_REQUEST_ID}\``,
+              `Repository: ${identity.repository}`,
+              `Frozen target SHA: \`${identity.targetSha}\``,
+              `Requirement source: ${identity.source.kind} (ingress: ${identity.source.ingress}, trust: ${identity.source.trust.by}${identity.source.kind === 'PRODUCT_EVALUATION' ? (identity.source.productImprovement.discoveryRun ? `, from Product Discovery run ${identity.source.productImprovement.discoveryRun}` : `, from cycle #${identity.source.productImprovement.cycleIssue}`) : ''}) — 출처는 provenance일 뿐이며 이후 lifecycle은 동일합니다.`,
+              `Requirement title/body SHA-256: \`${identity.requirement.digest}\``,
+              `Workflow run: ${identity.workflow.runId} / attempt: ${identity.workflow.runAttempt}`,
+              `PLAN artifact ID: ${process.env.PLAN_ARTIFACT_ID}`,
+              `PLAN artifact SHA-256: \`${process.env.PLAN_ARTIFACT_DIGEST}\``,
+              '이 PLAN은 제한된 Context Pack만 보고 생성되었고 public trusted validation에서 fresh exact SHA로 재검증되었습니다.',
+              decisionPacket,
+              '### HumanStatus: PLAN',
+              '**현재 상황:** AI가 계획을 제안했습니다. 아직 구현 승인이 아닙니다.',
+              `**다음 행동:** ${nextAction}`,
+            ].join('\n\n');
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: identity.requirement.issueNumber,
+              body,
+            });
+
+  # PLAN 결과를 받거나 검증하지 못하면 Issue에 아무 댓글도 남지 않던 문제를 막는다 (App #289 run 36982979475).
+  failure_notice:
+    needs: [plan, request, resolve]
+    if: >-
+      always() &&
+      needs.plan.result == 'success' &&
+      (needs.request.result == 'failure' || needs.resolve.result == 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      issues: write
+    steps:
+      - name: Leave PLAN failure notice on requirement Issue
+        uses: actions/github-script@v7
+        env:
+          PLAN_IDENTITY: ${{ needs.plan.outputs.identity }}
+          PLAN_FAILURE_REASON: ${{ needs.resolve.outputs.failure_reason }}
+          PLAN_EXECUTOR_FAILURE_REASON: ${{ needs.resolve.outputs.executor_failure_reason }}
+        with:
+          script: |
+            const identity = JSON.parse(process.env.PLAN_IDENTITY);
+            const issueNumber = identity.requirement?.issueNumber;
+            if (!Number.isSafeInteger(issueNumber) || issueNumber < 1) throw new Error('Missing PLAN requirement issue number');
+            const reason = (process.env.PLAN_FAILURE_REASON || '').replace(/[`\r\n]/g, ' ').trim().slice(0, 300);
+            const scopeTooLarge = /PLAN scope cannot hold existing tests/.test(reason);
+            const sizeMatch = /within (\d+) bounded paths \(changed (\d+) \+ impacted tests (\d+) = (\d+)\)/.exec(reason);
+            const sizeDetail = sizeMatch ? ` (PLAN이 고른 변경 파일 ${sizeMatch[2]}개 + 자동으로 더해지는 기존 테스트 ${sizeMatch[3]}개 = ${sizeMatch[4]}개, 한도 ${sizeMatch[1]}개)` : '';
+            // executor가 PLAN_FAILED marker로 알린 실패면 resolve job이 exact marker에서 읽은 사유만 받는다.
+            const EXECUTOR_FAILURE_EXPLANATIONS = {
+              REQUEST_REJECTED: 'executor가 PLAN 요청을 받거나 검증하지 못했습니다. 원인은 executor 저장소 Actions의 poller run 로그에서 확인하세요.',
+              EXECUTION_FAILED: 'executor의 Claude 호출이 끝까지 가지 못했거나 결과 형식 검증을 통과하지 못했습니다. 시간이나 도구 사용 한도 초과, 사람의 취소도 여기에 해당합니다. 원인은 executor 저장소 Actions의 poller run 로그에서 확인하세요.',
+              RESULT_POST_FAILED: 'executor가 PLAN 결과를 만들었지만 Issue에 올리지 못했습니다. executor의 bridge token 권한과 만료를 확인하세요.',
+            };
+            const executorReason = process.env.PLAN_EXECUTOR_FAILURE_REASON || '';
+            if (executorReason && !Object.hasOwn(EXECUTOR_FAILURE_EXPLANATIONS, executorReason)) {
+              throw new Error('invalid executor failure reason');
+            }
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              '## PLAN 실패 (게시된 PLAN 없음)',
+              `Workflow run: [${context.runId}](${runUrl}) / attempt: ${process.env.GITHUB_RUN_ATTEMPT}`,
+              executorReason ? `사유: \`executor가 PLAN_FAILED(${executorReason})를 알림\`` : reason ? `사유: \`${reason}\`` : '사유: 위 run 로그를 확인하세요.',
+              '### HumanStatus: PLAN_FAILED',
+              '**현재 상황:** PLAN 결과를 받지 못했거나 trusted 검증을 통과하지 못해 PLAN이 게시되지 않았습니다. 승인할 PLAN이 없습니다.',
+              ...(executorReason ? [`**쉬운 설명:** ${EXECUTOR_FAILURE_EXPLANATIONS[executorReason]} 이 run은 결과를 15분 기다리지 않고 바로 멈췄습니다.`] : []),
+              ...(scopeTooLarge ? [`**쉬운 설명:** 한 번에 바꾸려는 내용이 많아 PLAN을 만들 수 없습니다.${sizeDetail} 요구를 둘로 나누거나 바꾸려는 내용을 줄여서 본문에 적어 주세요.`] : []),
+              '**다음 행동:** 사유를 보고 필요하면 Issue 본문을 보완한 뒤, Actions → Read-only AI PLAN을 이 Issue 번호로 다시 실행하세요. Issue 본문을 고치는 것만으로는 PLAN이 다시 시작되지 않습니다. 진행하지 않으려면 사유를 남기고 Issue를 닫으세요.',
+            ].join('\n\n');
+            await github.rest.issues.createComment({ ...context.repo, issue_number: issueNumber, body });
