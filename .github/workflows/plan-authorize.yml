@@ -1,0 +1,131 @@
+name: Trusted PLAN_AUTHORIZE
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+concurrency:
+  group: plan-authorize-${{ github.repository }}-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    if: >-
+      github.event.issue.pull_request == null &&
+      github.event.comment.body == 'PLAN-승인'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Framework checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Framework runtime layout 준비
+        run: |
+          if grep -q '"name": "self-improvement-mvp"' package.json; then
+            mkdir -p .framework-runtime
+            cp package.json package-lock.json .framework-runtime/
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: .framework-runtime/package-lock.json
+
+      - run: |
+          npm ci --ignore-scripts --prefix .framework-runtime
+          ln -sT .framework-runtime/node_modules node_modules
+
+      - name: Trusted PLAN approval validation
+        id: authorize
+        run: .framework-runtime/node_modules/.bin/tsx src/self-improvement/plan-authorize-handler.ts
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Store PLAN_AUTHORIZE artifact
+        id: upload
+        if: steps.authorize.outputs.created == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.authorize.outputs.artifact_name }}
+          path: plan-authorize.json
+          if-no-files-found: error
+
+      - name: Leave PLAN_AUTHORIZE pointer
+        if: steps.authorize.outputs.created == 'true'
+        uses: actions/github-script@v7
+        env:
+          ARTIFACT_NAME: ${{ steps.authorize.outputs.artifact_name }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          PLAN_RUN_ID: ${{ steps.authorize.outputs.plan_run_id }}
+          PLAN_RUN_ATTEMPT: ${{ steps.authorize.outputs.plan_run_attempt }}
+        with:
+          script: |
+            const body = [
+              `<!-- self-improvement:PLAN_AUTHORIZE approval-comment=${context.payload.comment.id} run-id=${context.runId} run-attempt=${process.env.GITHUB_RUN_ATTEMPT} artifact=${process.env.ARTIFACT_NAME} -->`,
+              '## PLAN 승인 완료',
+              `승인된 PLAN run: ${process.env.PLAN_RUN_ID} / attempt: ${process.env.PLAN_RUN_ATTEMPT}`,
+              `PLAN_AUTHORIZE artifact: ${process.env.ARTIFACT_NAME}`,
+              `Artifact ID: ${process.env.ARTIFACT_ID}`,
+              `Artifact SHA-256: ${process.env.ARTIFACT_DIGEST}`,
+              '이 단계에서는 IMPLEMENT를 시작하지 않습니다.',
+              '### HumanStatus: PLAN_AUTHORIZE',
+              '**현재 상황:** 해당 PLAN에 대한 정확한 사람 승인 검증이 완료되었습니다. 구현 시작을 뜻하지 않습니다.',
+              '**다음 행동:** 승인된 PLAN과 구현 범위를 확인하고 별도의 구현 시작 절차를 진행하세요.',
+            ].join('\n\n');
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+      # fail-closed는 정상 상태지만 사람이 볼 수 있어야 한다 (architecture §5). 거부 이유와 다음 행동을 Issue에 남긴다.
+      # 이 run은 실패로 끝나므로 Handoff / Recovery는 시작되지 않고 PLAN_AUTHORIZE artifact도 만들어지지 않는다.
+      - name: Leave fail-closed reason on requirement Issue
+        if: failure() && steps.authorize.outputs.rejected == 'true'
+        uses: actions/github-script@v7
+        env:
+          REJECTION_REASON: ${{ steps.authorize.outputs.rejection_reason }}
+          REJECTION_NEXT_ACTION: ${{ steps.authorize.outputs.rejection_next_action }}
+          REJECTION_DETAIL: ${{ steps.authorize.outputs.rejection_detail }}
+          REJECTION_QUESTIONS: ${{ steps.authorize.outputs.rejection_questions }}
+        with:
+          script: |
+            const approvalCommentId = context.payload.comment.id;
+            const markerPrefix = `<!-- self-improvement:PLAN_AUTHORIZE_REJECTED approval-comment=${approvalCommentId} `;
+            const existing = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            if (existing.some((comment) => typeof comment.body === 'string' && comment.body.includes(markerPrefix))) {
+              core.info('rejection already recorded for this approval comment');
+              return;
+            }
+            const questions = (process.env.REJECTION_QUESTIONS ?? '').split('\n').map((line) => line.trim()).filter(Boolean);
+            const body = [
+              `${markerPrefix}run-id=${context.runId} run-attempt=${process.env.GITHUB_RUN_ATTEMPT} -->`,
+              '## PLAN-승인이 fail-closed로 거부됨',
+              `거부 사유: ${process.env.REJECTION_REASON}`,
+              `검증 메시지: \`${process.env.REJECTION_DETAIL}\``,
+              ...(questions.length > 0
+                ? [`남은 Blocking Question (${questions.length}개):\n${questions.map((question, index) => `${index + 1}. ${question}`).join('\n')}`]
+                : []),
+              'PLAN_AUTHORIZE artifact는 생성되지 않았고 IMPLEMENT는 시작되지 않습니다. 새 PLAN 댓글이 달리면 그 Decision Packet을 읽고 다시 승인 여부를 결정하세요.',
+              '### HumanStatus: STOPPED',
+              '**현재 상황:** PLAN 승인이 trusted 검증에서 거부되어 fail-closed 했습니다. 구현·검증·리뷰의 성공을 뜻하지 않습니다.',
+              `**다음 행동:** ${process.env.REJECTION_NEXT_ACTION}`,
+            ].join('\n\n');
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body,
+            });

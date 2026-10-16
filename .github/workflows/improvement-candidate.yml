@@ -1,0 +1,311 @@
+name: Trusted Improvement Candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      learn_run_id:
+        description: Successful Read-only AI LEARN workflow run ID
+        required: true
+        type: string
+      learn_run_attempt:
+        description: Exact LEARN workflow run attempt
+        required: true
+        type: string
+      learn_report_artifact_name:
+        description: Exact validated LEARN report artifact name
+        required: true
+        type: string
+      source_run_id:
+        description: Exact source run that produced the LEARN Input Pack
+        required: true
+        type: string
+      source_run_attempt:
+        description: Exact source workflow run attempt
+        required: true
+        type: string
+      learn_input_artifact_name:
+        description: Exact Trusted LEARN Input Pack artifact name
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  candidate:
+    name: trusted Improvement Candidate 구조화
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: trusted candidate control-plane checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Node 설정
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: trusted candidate 의존성 설치
+        run: npm ci --ignore-scripts
+
+      - name: exact LEARN/source run과 artifact 선택
+        id: source
+        uses: actions/github-script@v7
+        env:
+          LEARN_RUN_ID: ${{ inputs.learn_run_id }}
+          LEARN_RUN_ATTEMPT: ${{ inputs.learn_run_attempt }}
+          LEARN_REPORT_ARTIFACT_NAME: ${{ inputs.learn_report_artifact_name }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+          LEARN_INPUT_ARTIFACT_NAME: ${{ inputs.learn_input_artifact_name }}
+        with:
+          script: |
+            const positive = (name, value) => {
+              if (!/^[1-9]\d*$/.test(value || '')) throw new Error(`${name} must be a positive integer`);
+              return Number(value);
+            };
+            const learnRunId = positive('learn_run_id', process.env.LEARN_RUN_ID);
+            const learnRunAttempt = positive('learn_run_attempt', process.env.LEARN_RUN_ATTEMPT);
+            const sourceRunId = positive('source_run_id', process.env.SOURCE_RUN_ID);
+            const sourceRunAttempt = positive('source_run_attempt', process.env.SOURCE_RUN_ATTEMPT);
+
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            const exactSuccessfulRun = async (runId, attempt, label, expectedPath) => {
+              let run;
+              for (let poll = 0; poll < 12; poll += 1) {
+                ({ data: run } = await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: runId }));
+                if (run.run_attempt !== attempt) {
+                  throw new Error(`${label} attempt mismatch: expected=${attempt}, actual=${run.run_attempt}`);
+                }
+                if (run.status === 'completed') break;
+                await sleep(5000);
+              }
+              if (!run || run.status !== 'completed' || run.conclusion !== 'success') {
+                throw new Error(`${label} must reach exact completed success within bounded wait: status=${run?.status}, conclusion=${run?.conclusion}`);
+              }
+              if (run.path !== expectedPath || run.head_branch !== context.payload.repository.default_branch) {
+                throw new Error(`${label} workflow/default-branch identity mismatch`);
+              }
+              return run;
+            };
+            await exactSuccessfulRun(learnRunId, learnRunAttempt, 'LEARN run', '.github/workflows/learn.yml');
+            await exactSuccessfulRun(sourceRunId, sourceRunAttempt, 'source run', '.github/workflows/learn-source.yml');
+
+            const exactArtifact = async (runId, name, label) => {
+              const { data } = await github.rest.actions.listWorkflowRunArtifacts({ ...context.repo, run_id: runId, per_page: 100 });
+              const matches = data.artifacts.filter((artifact) => !artifact.expired && artifact.name === name);
+              if (matches.length !== 1) throw new Error(`expected one non-expired ${label} artifact named ${name}, found ${matches.length}`);
+              const artifact = matches[0];
+              if (!artifact.digest) throw new Error(`${label} artifact digest is required`);
+              return artifact;
+            };
+
+            const report = await exactArtifact(learnRunId, process.env.LEARN_REPORT_ARTIFACT_NAME, 'LEARN report');
+            const input = await exactArtifact(sourceRunId, process.env.LEARN_INPUT_ARTIFACT_NAME, 'LEARN input');
+
+            core.setOutput('learn_run_id', learnRunId);
+            core.setOutput('learn_run_attempt', learnRunAttempt);
+            core.setOutput('report_artifact_name', report.name);
+            core.setOutput('report_artifact_id', report.id);
+            core.setOutput('report_artifact_digest', report.digest);
+            core.setOutput('source_run_id', sourceRunId);
+            core.setOutput('source_run_attempt', sourceRunAttempt);
+            core.setOutput('input_artifact_name', input.name);
+            core.setOutput('input_artifact_id', input.id);
+            core.setOutput('input_artifact_digest', input.digest);
+
+      - name: exact LEARN report 다운로드
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.source.outputs.report_artifact_name }}
+          path: ${{ runner.temp }}/candidate-report-source
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.source.outputs.learn_run_id }}
+
+      - name: exact LEARN Input Pack 다운로드
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.source.outputs.input_artifact_name }}
+          path: ${{ runner.temp }}/candidate-input-source
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.source.outputs.source_run_id }}
+
+      - name: source artifact 구조 확인
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t report_files < <(find "${RUNNER_TEMP}/candidate-report-source" -type f -print)
+          mapfile -t input_files < <(find "${RUNNER_TEMP}/candidate-input-source" -type f -print)
+          if [ "${#report_files[@]}" -ne 1 ] || [ "$(basename "${report_files[0]}")" != "learn-report.json" ]; then
+            echo "LEARN report artifact must contain exactly learn-report.json" >&2
+            exit 1
+          fi
+          if [ "${#input_files[@]}" -ne 1 ] || [ "$(basename "${input_files[0]}")" != "learn-input-pack.json" ]; then
+            echo "LEARN Input Pack artifact must contain exactly learn-input-pack.json" >&2
+            exit 1
+          fi
+          mkdir -p "${RUNNER_TEMP}/improvement-candidate"
+          cp "${report_files[0]}" "${RUNNER_TEMP}/improvement-candidate/learn-report.json"
+          cp "${input_files[0]}" "${RUNNER_TEMP}/improvement-candidate/learn-input-pack.json"
+
+      - name: exact source binding 검증 및 proposal-only candidate 생성
+        id: candidate
+        run: npm exec -- tsx src/self-improvement/improvement-candidate-handler.ts
+        env:
+          LEARN_REPORT_JSON: ${{ runner.temp }}/improvement-candidate/learn-report.json
+          LEARN_INPUT_PACK_JSON: ${{ runner.temp }}/improvement-candidate/learn-input-pack.json
+          IMPROVEMENT_CANDIDATE_PACK_JSON: ${{ runner.temp }}/improvement-candidate/improvement-candidate-pack.json
+          LEARN_RUN_ID: ${{ steps.source.outputs.learn_run_id }}
+          LEARN_RUN_ATTEMPT: ${{ steps.source.outputs.learn_run_attempt }}
+          LEARN_REPORT_ARTIFACT_NAME: ${{ steps.source.outputs.report_artifact_name }}
+          LEARN_REPORT_ARTIFACT_ID: ${{ steps.source.outputs.report_artifact_id }}
+          LEARN_REPORT_ARTIFACT_DIGEST: ${{ steps.source.outputs.report_artifact_digest }}
+          LEARN_SOURCE_RUN_ID: ${{ steps.source.outputs.source_run_id }}
+          LEARN_SOURCE_RUN_ATTEMPT: ${{ steps.source.outputs.source_run_attempt }}
+          LEARN_INPUT_ARTIFACT_NAME: ${{ steps.source.outputs.input_artifact_name }}
+          LEARN_INPUT_ARTIFACT_ID: ${{ steps.source.outputs.input_artifact_id }}
+          LEARN_INPUT_ARTIFACT_DIGEST: ${{ steps.source.outputs.input_artifact_digest }}
+
+      - name: proposal-only Improvement Candidate artifact 저장
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.candidate.outputs.candidate_artifact_name }}
+          path: ${{ runner.temp }}/improvement-candidate/improvement-candidate-pack.json
+          if-no-files-found: error
+
+  # 머지 뒤 Product Discovery를 사람이 실행하지 않아도 시작할지 AI 없이 결정적으로 판단한다 (self-improvement-mvp #383).
+  # 사람이 저장소 변수 AUTO_PRODUCT_DISCOVERY=on을 켠 저장소에서만 이 job이 돈다. 꺼져 있으면 job 자체가 건너뛰어진다.
+  # 비용·폭주 상한: 마지막 Discovery 이후 Human Merge 3건, 열린 [Self-Improvement] Issue 없음, 마지막 시작 후 24시간, 실행 중인 run 없음.
+  # 이 job은 product-evaluation.yml을 dispatch할 뿐이고 후보 Issue, PLAN-승인, Merge는 만들지 않는다.
+  discovery_gate:
+    name: Product Discovery 자동 시작 판단
+    needs: candidate
+    if: >-
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      needs.candidate.result == 'success' &&
+      vars.AUTO_PRODUCT_DISCOVERY == 'on'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+      actions: write
+
+    steps:
+      - name: trusted control-plane checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          path: gate-control
+
+      - name: Node 설정
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Framework runtime 의존성 설치
+        working-directory: gate-control
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f .framework-runtime/package-lock.json ]; then
+            npm ci --ignore-scripts --prefix .framework-runtime
+            ln -sT .framework-runtime/node_modules node_modules
+          else
+            npm ci --ignore-scripts
+          fi
+
+      - name: 판단에 쓸 사실 수집
+        uses: actions/github-script@v7
+        env:
+          AUTO_DISCOVERY_INPUT_JSON: ${{ runner.temp }}/auto-discovery-input.json
+          AUTO_PRODUCT_DISCOVERY: ${{ vars.AUTO_PRODUCT_DISCOVERY }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const BOT = 'github-actions[bot]';
+            const paginate = async (fn, params, pages = 3) => {
+              const out = [];
+              for (let page = 1; page <= pages; page += 1) {
+                const { data } = await fn({ ...params, per_page: 100, page });
+                out.push(...data);
+                if (data.length < 100) break;
+              }
+              return out;
+            };
+            const defaultBranch = context.payload.repository.default_branch;
+
+            const issues = (await paginate(github.rest.issues.listForRepo, { ...context.repo, state: 'open' }))
+              .filter((issue) => !issue.pull_request);
+            const openCandidateCount = issues.filter((issue) => issue.title.startsWith('[Self-Improvement]')).length;
+
+            // Framework가 만든 Discovery 기록 Issue와 그 안의 요청 댓글만 믿는다(봇이 쓴 것만).
+            let lastDiscoveryAt = null;
+            const log = issues.find((issue) =>
+              issue.title === '[Product Discovery] 실행 기록' &&
+              issue.user?.login === BOT &&
+              (issue.body || '').includes('ai-dev-framework:PRODUCT_DISCOVERY_LOG v=1'));
+            if (log) {
+              const comments = await paginate(github.rest.issues.listComments, { ...context.repo, issue_number: log.number });
+              const requests = comments.filter((comment) =>
+                comment.user?.login === BOT && (comment.body || '').includes('ai-dev-framework:PRODUCT_EVALUATION_REQUEST'));
+              if (requests.length > 0) lastDiscoveryAt = requests[requests.length - 1].created_at;
+            }
+
+            const since = lastDiscoveryAt ? Date.parse(lastDiscoveryAt) : 0;
+            const pulls = await paginate(github.rest.pulls.list, {
+              ...context.repo, state: 'closed', base: defaultBranch, sort: 'updated', direction: 'desc',
+            });
+            const mergedSinceLast = pulls.filter((pull) =>
+              pull.merged_at && Date.parse(pull.merged_at) > since &&
+              pull.head.repo?.full_name === `${context.repo.owner}/${context.repo.repo}` &&
+              /^ai-publish\/issue-[0-9]+(?:-cycle-[0-9a-f]{16})?$/.test(pull.head.ref)).length;
+
+            let runInFlight = false;
+            for (const status of ['queued', 'in_progress']) {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                ...context.repo, workflow_id: 'product-evaluation.yml', status, per_page: 5,
+              });
+              if (data.workflow_runs.length > 0) runInFlight = true;
+            }
+
+            const input = {
+              enabled: process.env.AUTO_PRODUCT_DISCOVERY === 'on',
+              mergedSinceLast,
+              openCandidateCount,
+              lastDiscoveryAt,
+              now: new Date().toISOString(),
+              runInFlight,
+            };
+            fs.writeFileSync(process.env.AUTO_DISCOVERY_INPUT_JSON, JSON.stringify(input, null, 2));
+            core.info(JSON.stringify(input));
+
+      - name: 자동 시작 여부를 결정적으로 판단
+        id: gate
+        working-directory: gate-control
+        run: node_modules/.bin/tsx src/self-improvement/product-evaluation-handler.ts gate
+        env:
+          AUTO_DISCOVERY_INPUT_JSON: ${{ runner.temp }}/auto-discovery-input.json
+
+      - name: Trusted Product Evaluation 시작
+        if: steps.gate.outputs.action == 'dispatch'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              ...context.repo,
+              workflow_id: 'product-evaluation.yml',
+              ref: context.payload.repository.default_branch,
+            });
+            core.info('Trusted Product Evaluation을 자동으로 dispatch했습니다');

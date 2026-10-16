@@ -1,0 +1,466 @@
+name: Trusted PLAN Candidate Bridge
+
+on:
+  workflow_run:
+    workflows: ["PLAN Bounded IMPLEMENT Worker"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      source_worker_run_id:
+        description: completed PLAN Bounded IMPLEMENT Worker run ID
+        required: true
+        type: string
+      source_worker_run_attempt:
+        description: exact source Worker run attempt
+        required: true
+        type: string
+      source_candidate_artifact_name:
+        description: exact bounded Worker candidate artifact name
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  bridge:
+    if: >-
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'workflow_run' &&
+       github.event.workflow_run.head_branch == github.event.repository.default_branch) ||
+      github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+      actions: read
+      issues: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    outputs:
+      bridge_artifact_name: ${{ steps.prepare.outputs.bridge_artifact_name }}
+
+    steps:
+      - name: bounded Worker source와 candidate artifact exact 선택
+        id: candidate_artifact
+        uses: actions/github-script@v7
+        env:
+          RECOVERY_SOURCE_RUN_ID: ${{ inputs.source_worker_run_id }}
+          RECOVERY_SOURCE_RUN_ATTEMPT: ${{ inputs.source_worker_run_attempt }}
+          RECOVERY_SOURCE_ARTIFACT: ${{ inputs.source_candidate_artifact_name }}
+        with:
+          script: |
+            const explicitRecovery = context.eventName === 'workflow_dispatch';
+            let run;
+            let requestedArtifact = null;
+
+            if (explicitRecovery) {
+              const runId = Number(process.env.RECOVERY_SOURCE_RUN_ID);
+              const runAttempt = Number(process.env.RECOVERY_SOURCE_RUN_ATTEMPT);
+              requestedArtifact = process.env.RECOVERY_SOURCE_ARTIFACT;
+              if (!Number.isSafeInteger(runId) || runId <= 0 ||
+                  !Number.isSafeInteger(runAttempt) || runAttempt <= 0) {
+                core.setFailed('invalid recovery Worker run identity');
+                return;
+              }
+
+              const response = await github.rest.actions.getWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: runId,
+              });
+              run = response.data;
+              if (
+                run.name !== 'PLAN Bounded IMPLEMENT Worker' ||
+                run.path !== '.github/workflows/plan-implement-worker.yml' ||
+                run.event !== 'workflow_run' ||
+                run.status !== 'completed' ||
+                run.conclusion !== 'success' ||
+                run.head_branch !== context.payload.repository.default_branch ||
+                run.run_attempt !== runAttempt
+              ) {
+                core.setFailed(
+                  `invalid recovery Worker source: name=${run.name}, path=${run.path}, event=${run.event}, status=${run.status}, conclusion=${run.conclusion}, branch=${run.head_branch}, attempt=${run.run_attempt}`,
+                );
+                return;
+              }
+            } else {
+              run = context.payload.workflow_run;
+              if (
+                run.name !== 'PLAN Bounded IMPLEMENT Worker' ||
+                run.path !== '.github/workflows/plan-implement-worker.yml' ||
+                run.event !== 'workflow_run' ||
+                run.conclusion !== 'success' ||
+                run.head_branch !== context.payload.repository.default_branch
+              ) {
+                core.setFailed(`unexpected bounded Worker source: ${run.name} ${run.path} ${run.event} ${run.conclusion}`);
+                return;
+              }
+            }
+
+            const pattern = new RegExp(
+              `^bounded-worker-candidate-issue-\\d+-plan-\\d+-approval-\\d+-handoff-(\\d+)-attempt-(\\d+)-worker-${run.id}-attempt-${run.run_attempt}$`,
+            );
+            if (explicitRecovery && !pattern.test(requestedArtifact)) {
+              core.setFailed(`unexpected recovery candidate artifact: ${requestedArtifact}`);
+              return;
+            }
+
+            const { data } = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: run.id,
+              per_page: 100,
+            });
+            const matches = data.artifacts.filter((artifact) => !artifact.expired && pattern.test(artifact.name));
+            const exact = explicitRecovery
+              ? matches.filter((artifact) => artifact.name === requestedArtifact)
+              : matches;
+            if (matches.length !== 1 || exact.length !== 1) {
+              core.setFailed(
+                `expected exactly one bounded Worker candidate artifact; total=${matches.length}, exact=${exact.length}`,
+              );
+              return;
+            }
+            const artifact = exact[0];
+            const identity = pattern.exec(artifact.name);
+            if (!identity) {
+              core.setFailed('bounded Worker candidate artifact identity parse failed');
+              return;
+            }
+            const handoffRunId = Number(identity[1]);
+            const handoffRunAttempt = Number(identity[2]);
+            const { data: handoff } = await github.rest.actions.getWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: handoffRunId,
+            });
+            if (
+              handoff.name !== 'Trusted PLAN IMPLEMENT Handoff' ||
+              handoff.path !== '.github/workflows/plan-implement-handoff.yml' ||
+              handoff.event !== 'workflow_run' ||
+              handoff.status !== 'completed' ||
+              handoff.conclusion !== 'success' ||
+              handoff.run_attempt !== handoffRunAttempt ||
+              handoff.head_branch !== context.payload.repository.default_branch ||
+              !/^[0-9a-f]{40,64}$/.test(handoff.head_sha || '')
+            ) {
+              core.setFailed('candidate source Handoff identity mismatch');
+              return;
+            }
+            const approvedBaseSha = handoff.head_sha;
+            const recovery = explicitRecovery || run.head_sha !== approvedBaseSha;
+
+            core.setOutput('name', artifact.name);
+            core.setOutput('id', String(artifact.id));
+            core.setOutput('digest', artifact.digest ?? '');
+            core.setOutput('run_id', String(run.id));
+            core.setOutput('run_attempt', String(run.run_attempt));
+            core.setOutput('bridge_control_plane_sha', recovery ? context.sha : run.head_sha);
+            core.setOutput('recovery', recovery ? 'true' : 'false');
+            core.setOutput('approved_base_sha', approvedBaseSha);
+            core.setOutput('worker_head_sha', run.head_sha);
+
+      - name: recovery default 이동 trusted compare guard
+        id: recovery_guard
+        if: steps.candidate_artifact.outputs.recovery == 'true'
+        uses: actions/github-script@v7
+        env:
+          APPROVED_BASE_SHA: ${{ steps.candidate_artifact.outputs.approved_base_sha }}
+          WORKER_HEAD_SHA: ${{ steps.candidate_artifact.outputs.worker_head_sha }}
+        with:
+          script: |
+            const base = process.env.APPROVED_BASE_SHA;
+            const workerHead = process.env.WORKER_HEAD_SHA;
+            const defaultBranch = context.payload.repository.default_branch;
+            let currentDefaultSha;
+            let comparison;
+            let baseToWorker;
+            let workerToCurrent;
+            try {
+              const { data: branch } = await github.rest.repos.getBranch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                branch: defaultBranch,
+              });
+              currentDefaultSha = branch.commit.sha;
+              if (context.ref !== `refs/heads/${defaultBranch}` || context.sha !== currentDefaultSha) {
+                core.setFailed(
+                  `recovery trusted code is not exact current default: ref=${context.ref}, trusted=${context.sha}, default=${currentDefaultSha}`,
+                );
+                return;
+              }
+              const [baseToWorkerResponse, workerToCurrentResponse, comparisonResponse] = await Promise.all([
+                github.rest.repos.compareCommitsWithBasehead({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  basehead: `${base}...${workerHead}`,
+                  per_page: 100,
+                }),
+                github.rest.repos.compareCommitsWithBasehead({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  basehead: `${workerHead}...${currentDefaultSha}`,
+                  per_page: 100,
+                }),
+                github.rest.repos.compareCommitsWithBasehead({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  basehead: `${base}...${currentDefaultSha}`,
+                  per_page: 100,
+                }),
+              ]);
+              baseToWorker = baseToWorkerResponse.data;
+              workerToCurrent = workerToCurrentResponse.data;
+              comparison = comparisonResponse.data;
+            } catch (error) {
+              core.setFailed(`recovery compare failed: ${error.message}`);
+              return;
+            }
+            if (
+              !['ahead', 'identical'].includes(baseToWorker.status) ||
+              baseToWorker.merge_base_commit.sha !== base ||
+              !['ahead', 'identical'].includes(workerToCurrent.status) ||
+              workerToCurrent.merge_base_commit.sha !== workerHead
+            ) {
+              core.setFailed('recovery Worker is outside approved-base/current-default lineage');
+              return;
+            }
+            const data = comparison;
+            const files = data.files;
+            if (
+              !['ahead', 'identical'].includes(data.status) ||
+              data.merge_base_commit.sha !== base ||
+              !Array.isArray(files) ||
+              files.length > 50
+            ) {
+              core.setFailed(`recovery compare is not a bounded ancestor diff: status=${data.status}, files=${files?.length}`);
+              return;
+            }
+            const frameworkRootTests = new Set([
+              'test/orchestrator-workflow.test.ts',
+              'test/plan-candidate-bridge-workflow.test.ts',
+              'test/plan-candidate-bridge.test.ts',
+              'test/fix-dispatch-workflow.test.ts',
+              'test/plan-candidate-bridge-recovery-finalize.test.ts',
+              'test/plan-candidate-bridge-recovery-provenance.test.ts',
+              'test/plan-implement-worker-workflow.test.ts',
+              'test/plan-implement-worker.test.ts',
+              'test/plan-worker-recovery-preflight-workflow.test.ts',
+              'test/plan-trusted-rail-recovery-source.test.ts',
+              'test/seal-workflow.test.ts',
+            ]);
+            const frameworkTest = (path) =>
+              path.startsWith('test/self-improvement/') || frameworkRootTests.has(path);
+            const frameworkDoc = /^docs\/(?:self-improvement\/|(?:architecture|trust-model|state-machine|phase-[1-6]-[^/]+|orchestrator-smoke|fix-loop-smoke-[^/]+)\.md$)/;
+            const allowed = (path) => path.startsWith('.github/workflows/') ||
+              path.startsWith('src/self-improvement/') || path === 'FRAMEWORK.md' ||
+              frameworkDoc.test(path) || frameworkTest(path);
+            const rejected = files.filter((file) =>
+              !['added', 'modified'].includes(file.status) || !allowed(file.filename) || file.previous_filename,
+            );
+            if (rejected.length > 0) {
+              core.setFailed(`recovery requires re-plan; ambiguous or application changes: ${rejected.map((f) => `${f.status}:${f.filename}`).join(',')}`);
+              return;
+            }
+            core.setOutput('kind', 'trusted-recovery-compare-v1');
+            core.setOutput('base_sha', base);
+            core.setOutput('worker_head_sha', workerHead);
+            core.setOutput('default_sha', currentDefaultSha);
+
+      - name: Trusted bridge control-plane checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.candidate_artifact.outputs.bridge_control_plane_sha }}
+          persist-credentials: false
+          path: bridge-control
+
+      - name: Framework runtime layout 준비
+        working-directory: bridge-control
+        run: |
+          if grep -q '"name": "self-improvement-mvp"' package.json; then
+            mkdir -p .framework-runtime
+            cp package.json package-lock.json .framework-runtime/
+          fi
+
+      - name: Node 설정
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: bridge-control/.framework-runtime/package-lock.json
+
+      - name: Trusted bridge dependencies 설치
+        working-directory: bridge-control
+        run: |
+          npm ci --ignore-scripts --prefix .framework-runtime
+          ln -sT .framework-runtime/node_modules node_modules
+
+      - name: bounded Worker candidate artifact 다운로드
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.candidate_artifact.outputs.name }}
+          path: ${{ runner.temp }}/plan-bridge-candidate
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.candidate_artifact.outputs.run_id }}
+
+      - name: candidate provenance 검증 및 Handoff exact identity 준비
+        id: prepare
+        working-directory: bridge-control
+        run: .framework-runtime/node_modules/.bin/tsx src/self-improvement/plan-candidate-bridge-handler.ts prepare
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SOURCE_WORKER_RUN_ID: ${{ steps.candidate_artifact.outputs.run_id }}
+          SOURCE_WORKER_RUN_ATTEMPT: ${{ steps.candidate_artifact.outputs.run_attempt }}
+          SOURCE_CANDIDATE_ARTIFACT_NAME: ${{ steps.candidate_artifact.outputs.name }}
+          SOURCE_CANDIDATE_ARTIFACT_ID: ${{ steps.candidate_artifact.outputs.id }}
+          SOURCE_CANDIDATE_ARTIFACT_DIGEST: ${{ steps.candidate_artifact.outputs.digest }}
+          SOURCE_CANDIDATE_DIRECTORY: ${{ runner.temp }}/plan-bridge-candidate
+          BRIDGE_RUN_ID: ${{ github.run_id }}
+          BRIDGE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          TRUSTED_RECOVERY_GUARD_KIND: ${{ steps.recovery_guard.outputs.kind }}
+          TRUSTED_RECOVERY_BASE_SHA: ${{ steps.recovery_guard.outputs.base_sha }}
+          TRUSTED_RECOVERY_WORKER_SHA: ${{ steps.recovery_guard.outputs.worker_head_sha }}
+          TRUSTED_RECOVERY_DEFAULT_SHA: ${{ steps.recovery_guard.outputs.default_sha }}
+
+      - name: exact Handoff artifact 다운로드
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.prepare.outputs.handoff_artifact_name }}
+          path: ${{ runner.temp }}/plan-bridge-handoff
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.prepare.outputs.handoff_run_id }}
+
+      - name: exact base SHA checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.prepare.outputs.base_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          path: validation-target
+
+      - name: exact base checkout SHA 확인
+        id: base
+        working-directory: validation-target
+        shell: bash
+        env:
+          EXPECTED_BASE_SHA: ${{ steps.prepare.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          ACTUAL_BASE_SHA="$(git rev-parse HEAD)"
+          if [ "$ACTUAL_BASE_SHA" != "$EXPECTED_BASE_SHA" ]; then
+            echo "exact base checkout SHA mismatch" >&2
+            exit 1
+          fi
+          echo "sha=${ACTUAL_BASE_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: validation target dependencies 설치
+        working-directory: validation-target
+        env:
+          GH_TOKEN: ""
+          GITHUB_TOKEN: ""
+          NODE_AUTH_TOKEN: ""
+          NPM_TOKEN: ""
+        run: npm ci --ignore-scripts
+
+      - name: candidate exact-base 적용 및 deterministic CI
+        working-directory: bridge-control
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SOURCE_WORKER_RUN_ID: ${{ steps.candidate_artifact.outputs.run_id }}
+          SOURCE_WORKER_RUN_ATTEMPT: ${{ steps.candidate_artifact.outputs.run_attempt }}
+          SOURCE_CANDIDATE_ARTIFACT_NAME: ${{ steps.candidate_artifact.outputs.name }}
+          SOURCE_CANDIDATE_ARTIFACT_ID: ${{ steps.candidate_artifact.outputs.id }}
+          SOURCE_CANDIDATE_ARTIFACT_DIGEST: ${{ steps.candidate_artifact.outputs.digest }}
+          SOURCE_CANDIDATE_DIRECTORY: ${{ runner.temp }}/plan-bridge-candidate
+          HANDOFF_DIRECTORY: ${{ runner.temp }}/plan-bridge-handoff
+          TARGET_DIRECTORY: ${{ github.workspace }}/validation-target
+          OBSERVED_BASE_SHA: ${{ steps.base.outputs.sha }}
+          STATE_DIRECTORY: ${{ runner.temp }}/plan-bridge-state
+          TRUSTED_RECOVERY_GUARD_KIND: ${{ steps.recovery_guard.outputs.kind }}
+          TRUSTED_RECOVERY_BASE_SHA: ${{ steps.recovery_guard.outputs.base_sha }}
+          TRUSTED_RECOVERY_WORKER_SHA: ${{ steps.recovery_guard.outputs.worker_head_sha }}
+          TRUSTED_RECOVERY_DEFAULT_SHA: ${{ steps.recovery_guard.outputs.default_sha }}
+        run: .framework-runtime/node_modules/.bin/tsx src/self-improvement/plan-candidate-bridge-handler.ts validate
+
+      - name: canonical patch와 bridge provenance 생성
+        working-directory: bridge-control
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          SOURCE_WORKER_RUN_ID: ${{ steps.candidate_artifact.outputs.run_id }}
+          SOURCE_WORKER_RUN_ATTEMPT: ${{ steps.candidate_artifact.outputs.run_attempt }}
+          SOURCE_CANDIDATE_ARTIFACT_NAME: ${{ steps.candidate_artifact.outputs.name }}
+          SOURCE_CANDIDATE_ARTIFACT_ID: ${{ steps.candidate_artifact.outputs.id }}
+          SOURCE_CANDIDATE_ARTIFACT_DIGEST: ${{ steps.candidate_artifact.outputs.digest }}
+          SOURCE_CANDIDATE_DIRECTORY: ${{ runner.temp }}/plan-bridge-candidate
+          HANDOFF_DIRECTORY: ${{ runner.temp }}/plan-bridge-handoff
+          TARGET_DIRECTORY: ${{ github.workspace }}/validation-target
+          OBSERVED_BASE_SHA: ${{ steps.base.outputs.sha }}
+          STATE_DIRECTORY: ${{ runner.temp }}/plan-bridge-state
+          BRIDGE_OUTPUT_DIRECTORY: ${{ runner.temp }}/plan-bridge-output
+          BRIDGE_RUN_ID: ${{ github.run_id }}
+          BRIDGE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          BRIDGE_TRUSTED_CODE_SHA: ${{ steps.candidate_artifact.outputs.bridge_control_plane_sha }}
+          TRUSTED_RECOVERY_GUARD_KIND: ${{ steps.recovery_guard.outputs.kind }}
+          TRUSTED_RECOVERY_BASE_SHA: ${{ steps.recovery_guard.outputs.base_sha }}
+          TRUSTED_RECOVERY_WORKER_SHA: ${{ steps.recovery_guard.outputs.worker_head_sha }}
+          TRUSTED_RECOVERY_DEFAULT_SHA: ${{ steps.recovery_guard.outputs.default_sha }}
+        run: .framework-runtime/node_modules/.bin/tsx src/self-improvement/plan-candidate-bridge-handler.ts finalize
+
+      - name: canonical PLAN bridge artifact 저장
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepare.outputs.bridge_artifact_name }}
+          path: |
+            ${{ runner.temp }}/plan-bridge-output/candidate.patch
+            ${{ runner.temp }}/plan-bridge-output/plan-bridge.json
+          if-no-files-found: error
+
+  dispatch_trusted_rail:
+    name: explicit Trusted Rail dispatch
+    needs: bridge
+    if: needs.bridge.result == 'success'
+    permissions:
+      actions: write
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: exact PLAN bridge identity로 Trusted Rail 시작
+        uses: actions/github-script@v7
+        env:
+          CANDIDATE_ARTIFACT: ${{ needs.bridge.outputs.bridge_artifact_name }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          CURRENT_RUN_ATTEMPT: ${{ github.run_attempt }}
+        with:
+          script: |
+            const artifactName = process.env.CANDIDATE_ARTIFACT;
+            const currentRunId = Number(process.env.CURRENT_RUN_ID);
+            const currentRunAttempt = Number(process.env.CURRENT_RUN_ATTEMPT);
+            if (!Number.isSafeInteger(currentRunId) || currentRunId <= 0 ||
+                !Number.isSafeInteger(currentRunAttempt) || currentRunAttempt <= 0) {
+              core.setFailed('invalid current PLAN bridge run identity');
+              return;
+            }
+            const expected = new RegExp(
+              `^plan-bridge-candidate-issue-\\d+-worker-\\d+-attempt-\\d+-bridge-${currentRunId}-attempt-${currentRunAttempt}$`,
+            );
+            if (!expected.test(artifactName)) {
+              core.setFailed(`unexpected PLAN bridge artifact identity: ${artifactName}`);
+              return;
+            }
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'trusted-rail.yml',
+              ref: context.payload.repository.default_branch,
+              inputs: {
+                source_candidate_kind: 'PLAN_BRIDGE',
+                source_candidate_run_id: String(currentRunId),
+                source_candidate_run_attempt: String(currentRunAttempt),
+                source_candidate_artifact_name: artifactName,
+              },
+            });
