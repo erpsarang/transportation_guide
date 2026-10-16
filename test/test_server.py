@@ -1,3 +1,4 @@
+import http.client
 import json
 import threading
 import unittest
@@ -20,13 +21,15 @@ class FakeProvider:
             raise ServiceUnavailable()
         if address == "버그":
             raise RuntimeError("boom")
-        if address not in ("시청", "역"):
+        if address not in ("시청", "역", "부분"):
             raise AddressNotFound(address)
         return Place(address, 37.5, 127.1)
 
     def route(self, origin, destination, mode):
         if destination.name == "역":
             raise NoRouteFound(mode)
+        if destination.name == "부분" and mode == "car":
+            raise ServiceUnavailable()
         seconds = {"walk": 1800, "bike": 600, "car": 900}[mode]
         return RouteOption(mode, seconds, 2000, mode + " 경로")
 
@@ -71,6 +74,14 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual([r["mode"] for r in body["routes"]], ["bike", "car", "walk"])
         self.assertTrue(body["routes"][0]["fastest"])
+        self.assertEqual(body["unavailable"], [])
+
+    def test_partial_failure_lists_unavailable_mode(self):
+        status, body = self.post({"destination": "부분", "lat": 1, "lon": 1})
+        self.assertEqual(status, 200)
+        self.assertEqual([r["mode"] for r in body["routes"]], ["bike", "walk"])
+        self.assertEqual([u["mode"] for u in body["unavailable"]], ["car"])
+        self.assertTrue(body["unavailable"][0]["reason"])
 
     def test_recommend_with_origin_address_via_get(self):
         url = self.base + "/api/recommend?destination=%EC%8B%9C%EC%B2%AD&origin_address=%EC%97%AD"
@@ -113,6 +124,27 @@ class ServerTest(unittest.TestCase):
         request = urllib.request.Request(self.base + "/api/recommend", data=b"{not json")
         status, _ = self.send(request)
         self.assertEqual(status, 400)
+
+    def raw_post_with_length(self, value):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
+        try:
+            connection.putrequest("POST", "/api/recommend")
+            connection.putheader("Content-Length", value)
+            connection.endheaders()
+            response = connection.getresponse()
+            return response.status, json.loads(response.read())
+        finally:
+            connection.close()
+
+    def test_negative_content_length_is_invalid_input(self):
+        status, body = self.raw_post_with_length("-1")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_input")
+
+    def test_non_numeric_content_length_is_invalid_input(self):
+        status, body = self.raw_post_with_length("abc")
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "invalid_input")
 
     def test_unknown_path(self):
         status, _ = self.send(urllib.request.Request(self.base + "/nope"))
