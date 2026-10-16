@@ -31,6 +31,7 @@
 <div id="location-status" class="notice" hidden></div>
 <div id="error" class="error" role="alert" hidden></div>
 <ul id="results"></ul>
+<ul id="unavailable"></ul>
 <script>
 (function () {
   var MODE_LABELS = { walk: "도보", bike: "자전거", car: "자동차" };
@@ -40,6 +41,8 @@
   var statusBox = document.getElementById("location-status");
   var errorBox = document.getElementById("error");
   var results = document.getElementById("results");
+  var unavailableList = document.getElementById("unavailable");
+  var FETCH_TIMEOUT_MS = 60000;
   var submit = document.getElementById("submit");
   var position = null;
 
@@ -109,10 +112,20 @@
     });
   }
 
+  function renderUnavailable(items) {
+    unavailableList.textContent = "";
+    items.forEach(function (entry) {
+      var item = document.createElement("li");
+      item.textContent = (MODE_LABELS[entry.mode] || entry.mode) + ": " + entry.reason;
+      unavailableList.appendChild(item);
+    });
+  }
+
   form.addEventListener("submit", function (event) {
     event.preventDefault();
     errorBox.hidden = true;
     results.textContent = "";
+    unavailableList.textContent = "";
     var body = { destination: document.getElementById("destination").value };
     if (position && originBox.hidden) {
       body.lat = position.lat;
@@ -128,10 +141,13 @@
       return;
     }
     submit.disabled = true;
+    var controller = new AbortController();
+    var timer = setTimeout(function () { controller.abort(); }, FETCH_TIMEOUT_MS);
     fetch("/api/recommend", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      signal: controller.signal
     }).then(function (response) {
       return response.json().then(function (data) {
         return { ok: response.ok, data: data };
@@ -143,10 +159,12 @@
         showError("표시할 경로가 없습니다. 다시 시도해 주세요.");
       } else {
         render(result.data.routes);
+        renderUnavailable(result.data.unavailable || []);
       }
     }).catch(function () {
       showError("서버에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.");
     }).then(function () {
+      clearTimeout(timer);
       submit.disabled = false;
     });
   });

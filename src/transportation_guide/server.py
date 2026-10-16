@@ -9,10 +9,10 @@ from urllib.parse import parse_qs, urlparse
 from .providers import (
     AddressNotFound,
     NoRouteFound,
+    OsmProvider,
     Place,
     Provider,
     ServiceUnavailable,
-    UnconfiguredProvider,
 )
 from .recommend import recommend
 
@@ -42,13 +42,16 @@ def handle_recommend(provider: Provider, params: dict) -> tuple[int, dict]:
         origin_address = params.get("origin_address")
         if origin_address is not None and not isinstance(origin_address, str):
             raise ValueError("출발지 주소가 올바르지 않습니다.")
-        options = recommend(
+        result = recommend(
             provider,
             destination or "",
             origin=_parse_origin(params),
             origin_address=origin_address,
         )
-        return 200, {"routes": [asdict(option) for option in options]}
+        return 200, {
+            "routes": [asdict(option) for option in result.routes],
+            "unavailable": [asdict(item) for item in result.unavailable],
+        }
     except ValueError as error:
         return 400, {"error": "invalid_input", "message": str(error)}
     except AddressNotFound:
@@ -107,7 +110,7 @@ def make_handler(provider: Provider):
                 return
             try:
                 length = int(self.headers.get("Content-Length") or 0)
-                if length > MAX_BODY_BYTES:
+                if length < 0 or length > MAX_BODY_BYTES:
                     raise ValueError("요청이 너무 큽니다.")
                 params = json.loads(self.rfile.read(length) or b"{}")
                 if not isinstance(params, dict):
@@ -124,8 +127,8 @@ def make_handler(provider: Provider):
 
 
 def make_server(provider: Provider | None = None, host: str = "127.0.0.1", port: int = 8000):
-    """provider를 주입할 수 있는 서버를 만든다. 생략하면 서비스 미설정 provider를 쓴다."""
-    return ThreadingHTTPServer((host, port), make_handler(provider or UnconfiguredProvider()))
+    """provider를 주입할 수 있는 서버를 만든다. 생략하면 OpenStreetMap 기반 provider를 쓴다."""
+    return ThreadingHTTPServer((host, port), make_handler(provider or OsmProvider()))
 
 
 def main() -> None:

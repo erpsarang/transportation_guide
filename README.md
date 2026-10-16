@@ -50,9 +50,17 @@ PYTHONPATH=src python3 -m transportation_guide.server
 - 주소를 찾지 못하거나 경로가 없거나 외부 서비스가 응답하지 않으면 이유와 다시 시도하라는 안내가 나온다.
 - API는 `POST /api/recommend` (JSON: `destination`, `lat`/`lon` 또는 `origin_address`)이며 `GET /api/recommend` 쿼리도 받는다.
 
+### 사용하는 외부 서비스
+
+둘 다 API key나 가입이 필요 없는 공개 서비스이며, 호출은 `providers.py` 안에만 있다.
+
+- 주소 → 좌표: [OpenStreetMap Nominatim](https://nominatim.openstreetmap.org). 요청에 User-Agent `transportation_guide/0.1` 을 붙이고, 초당 1회를 넘겨 호출하지 않는다(주소 변환이 두 번이면 1초 이상 간격을 둔다).
+- 경로 조회: FOSSGIS가 운영하는 OSRM(`routing.openstreetmap.de`). 도보 `routed-foot`, 자전거 `routed-bike`, 자동차 `routed-car`.
+- 서버는 외부 서비스를 10초까지 기다리고, 화면은 서버를 60초까지 기다린다. 일부 수단만 실패하면 나머지 결과와 함께 빠진 수단의 이유를 보여 준다.
+
 ### 후속 범위
 
-- 실제 주소 변환·경로 서비스 어댑터는 아직 없다. 서비스 선정과 응답 파싱이 필요하며, 그 전까지 기본 설정에서는 검색하면 "경로 서비스가 응답하지 않습니다" 안내가 나온다. 어댑터는 `providers.py` 안에만 추가한다.
+- 주소 변환·경로 서비스는 연결되어 있다. 캐시, 로그인, 검색 기록은 없다.
 - 대중교통, 지도 표시는 다음 요구에서 다룬다.
 
 테스트(`npm test`)는 가짜 provider를 쓰므로 외부 서비스를 호출하지 않는다.
