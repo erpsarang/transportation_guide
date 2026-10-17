@@ -103,6 +103,36 @@ class StaticPageTest(unittest.TestCase):
         self.assertNotIn("requestSubmit", self.html)
         self.assertNotIn(".submit()", self.html)
 
+    def test_recent_origins_markup(self):
+        self.assertIn('id="origin-recent-box" hidden', self.html)
+        self.assertIn("최근 출발지", self.html)
+        self.assertIn('id="origin-recent-list"', self.html)
+        self.assertIn('id="origin-recent-clear"', self.html)
+        box_start = self.html.index('id="origin-box"')
+        self.assertLess(box_start, self.html.index('id="origin-recent-box"'))
+        self.assertLess(self.html.index('id="origin-address"'), self.html.index('id="origin-recent-box"'))
+        self.assertLess(self.html.index('id="origin-recent-box"'), self.html.index('id="access-box"'))
+
+    def test_recent_origins_storage(self):
+        self.assertIn('"transportation_guide_recent_origins"', self.html)
+        self.assertIn("try { localStorage.setItem(ORIGIN_RECENT_KEY", self.html)
+        self.assertIn("try { localStorage.removeItem(ORIGIN_RECENT_KEY)", self.html)
+        self.assertIn("try {\n      var parsed = JSON.parse(localStorage.getItem(ORIGIN_RECENT_KEY)", self.html)
+        self.assertIn("slice(0, RECENT_MAX)", self.html)
+
+    def test_recent_origin_pick_does_not_submit(self):
+        self.assertIn("originInput.value = text;", self.html)
+
+    def test_recent_origin_saved_only_on_address_success(self):
+        self.assertEqual(self.html.count("saveRecentOrigin(requestedOrigin)"), 1)
+        self.assertEqual(self.html.count("requestedOrigin = originInput.value.trim();"), 1)
+        origin_at = self.html.index("requestedOrigin = originInput.value.trim();")
+        self.assertLess(self.html.index("body.origin_address = originInput.value;"), origin_at)
+        save_at = self.html.index("saveRecentOrigin(requestedOrigin);")
+        self.assertLess(self.html.index("render(result.data.routes, result.data);"), save_at)
+        self.assertLess(save_at, self.html.index("showMap(result.data);"))
+        self.assertLess(self.html.index("showError(\"표시할 경로가 없습니다"), save_at)
+
 
 if __name__ == "__main__":
     unittest.main()
