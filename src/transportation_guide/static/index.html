@@ -160,7 +160,24 @@
     return (meters / 1000).toFixed(1) + "km";
   }
 
-  function render(routes) {
+  var KAKAO_MODES = { car: "car", walk: "walk", bike: "bicycle" };
+  var KAKAO_LINK_TEXT = "카카오맵에서 길안내";
+
+  function kakaoPoint(place, fallbackName) {
+    if (!place || !isPoint(place.lat, place.lon)) return null;
+    var name = typeof place.name === "string" ? place.name.trim() : "";
+    return encodeURIComponent(name || fallbackName) + "," + place.lat + "," + place.lon;
+  }
+
+  function kakaoDirectionsUrl(mode, origin, destination) {
+    if (!Object.prototype.hasOwnProperty.call(KAKAO_MODES, mode)) return null;
+    var from = kakaoPoint(origin, "현재 위치");
+    var to = kakaoPoint(destination, "목적지");
+    if (!from || !to) return null;
+    return "https://map.kakao.com/link/by/" + KAKAO_MODES[mode] + "/" + from + "/" + to;
+  }
+
+  function render(routes, data) {
     results.textContent = "";
     routes.forEach(function (route) {
       var item = document.createElement("li");
@@ -181,6 +198,19 @@
         var summary = document.createElement("div");
         summary.textContent = route.summary;
         item.appendChild(summary);
+      }
+      var kakaoUrl = data ? kakaoDirectionsUrl(route.mode, data.origin, data.destination) : null;
+      if (kakaoUrl) {
+        var linkLine = document.createElement("div");
+        var link = document.createElement("a");
+        link.href = kakaoUrl;
+        link.textContent = KAKAO_LINK_TEXT;
+        link.target = "_blank";
+        link.rel = "noopener";
+        link.addEventListener("click", function (event) { event.stopPropagation(); });
+        link.addEventListener("keydown", function (event) { event.stopPropagation(); });
+        linkLine.appendChild(link);
+        item.appendChild(linkLine);
       }
       item.className = "route";
       item.setAttribute("data-mode", route.mode);
@@ -518,7 +548,7 @@
       } else if (!result.data.routes || !result.data.routes.length) {
         showError("표시할 경로가 없습니다. 다시 시도해 주세요.");
       } else {
-        render(result.data.routes);
+        render(result.data.routes, result.data);
         saveRecent(requestedDestination);
         renderUnavailable(result.data.unavailable || []);
         showMap(result.data);
