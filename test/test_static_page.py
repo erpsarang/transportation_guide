@@ -45,7 +45,7 @@ class StaticPageTest(unittest.TestCase):
         self.assertIn("지도 이미지를 불러오지 못했습니다", self.html)
         self.assertIn("지도를 표시하지 못했습니다", self.html)
         self.assertIn("img.onerror", self.html)
-        self.assertLess(self.html.index("render(result.data.routes);"), self.html.index("showMap(result.data);"))
+        self.assertLess(self.html.index("render(result.data.routes, result.data);"), self.html.index("showMap(result.data);"))
 
     def test_map_reset_on_submit_and_selection(self):
         self.assertIn("clearMap();", self.html)
@@ -70,12 +70,32 @@ class StaticPageTest(unittest.TestCase):
         self.assertIn("try {\n      var parsed = JSON.parse(localStorage.getItem(RECENT_KEY)", self.html)
 
     def test_recent_destinations_saved_only_on_success(self):
-        render_at = self.html.index("render(result.data.routes);")
+        render_at = self.html.index("render(result.data.routes, result.data);")
         save_at = self.html.index("saveRecent(requestedDestination);")
         self.assertLess(render_at, save_at)
         self.assertLess(save_at, self.html.index("showMap(result.data);"))
         self.assertLess(self.html.index("showError(\"표시할 경로가 없습니다"), save_at)
         self.assertEqual(self.html.count("saveRecent(requestedDestination)"), 1)
+
+    def test_kakao_directions_link(self):
+        start = self.html.index("function kakaoDirectionsUrl")
+        body = self.html[start:self.html.index("function render(", start)]
+        self.assertIn("https://map.kakao.com/link/by/", body)
+        self.assertIn('bike: "bicycle"', self.html)
+        self.assertIn("encodeURIComponent", self.html)
+        self.assertIn("현재 위치", body)
+        self.assertIn("return null;", body)
+        self.assertNotIn("traffic", self.html)
+        self.assertNotIn("kakaomap://", self.html)
+        self.assertNotIn("access", body.lower())
+        self.assertNotIn("storedCode", body)
+
+    def test_kakao_link_markup_and_event_isolation(self):
+        self.assertIn("카카오맵에서 길안내", self.html)
+        self.assertIn('link.target = "_blank";', self.html)
+        self.assertIn('link.rel = "noopener";', self.html)
+        self.assertEqual(self.html.count("event.stopPropagation();"), 2)
+        self.assertIn("function render(routes, data)", self.html)
 
     def test_recent_destination_pick_does_not_submit(self):
         self.assertIn("destinationInput.value = text;", self.html)
