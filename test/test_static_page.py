@@ -79,13 +79,15 @@ class StaticPageTest(unittest.TestCase):
 
     def test_kakao_directions_link(self):
         start = self.html.index("function kakaoDirectionsUrl")
-        body = self.html[start:self.html.index("function render(", start)]
+        body = self.html[start:self.html.index("function kakaoTransitUrl", start)]
         self.assertIn("https://map.kakao.com/link/by/", body)
         self.assertIn('bike: "bicycle"', self.html)
         self.assertIn("encodeURIComponent", self.html)
         self.assertIn("현재 위치", body)
         self.assertIn("return null;", body)
-        self.assertNotIn("traffic", self.html)
+        self.assertNotIn("traffic", body)
+        self.assertIn('var KAKAO_MODES = { car: "car", walk: "walk", bike: "bicycle" };', self.html)
+        self.assertNotIn("traffic", self.html[self.html.index("var KAKAO_MODES"):self.html.index("var KAKAO_LINK_TEXT")])
         self.assertNotIn("kakaomap://", self.html)
         self.assertNotIn("access", body.lower())
         self.assertNotIn("storedCode", body)
@@ -96,6 +98,38 @@ class StaticPageTest(unittest.TestCase):
         self.assertIn('link.rel = "noopener";', self.html)
         self.assertEqual(self.html.count("event.stopPropagation();"), 2)
         self.assertIn("function render(routes, data)", self.html)
+
+    def test_transit_link_url_and_text(self):
+        start = self.html.index("function kakaoTransitUrl")
+        body = self.html[start:self.html.index("function renderTransit", start)]
+        self.assertIn("https://map.kakao.com/link/by/traffic/", body)
+        self.assertEqual(body.count("kakaoPoint("), 2)
+        self.assertIn("return null;", body)
+        self.assertIn('var TRANSIT_LINK_TEXT = "대중교통은 카카오맵에서 길안내";', self.html)
+        self.assertEqual(self.html.count("대중교통은 카카오맵에서 길안내"), 1)
+        render_start = self.html.index("function renderTransit")
+        render_body = self.html[render_start:self.html.index("function render(", render_start)]
+        self.assertNotIn("access", render_body.lower())
+        self.assertNotIn("storedCode", render_body)
+        self.assertNotIn("fetch", render_body)
+        self.assertNotIn("kakaomap://", self.html)
+
+    def test_transit_box_markup_position(self):
+        self.assertIn('id="transit-box" hidden', self.html)
+        self.assertLess(self.html.index('<ul id="results">'), self.html.index('id="transit-box"'))
+        self.assertLess(self.html.index('id="transit-box"'), self.html.index('id="unavailable-box"'))
+        self.assertIn('target="_blank" rel="noopener"', self.html[self.html.index('id="transit-link"'):])
+
+    def test_transit_call_order_and_reset(self):
+        self.assertEqual(self.html.count("renderTransit(result.data);"), 1)
+        call_at = self.html.index("renderTransit(result.data);")
+        self.assertLess(self.html.index("render(result.data.routes, result.data);"), call_at)
+        self.assertLess(call_at, self.html.index("showMap(result.data);"))
+        self.assertLess(self.html.index("showError(\"표시할 경로가 없습니다"), call_at)
+        submit_at = self.html.index('form.addEventListener("submit"')
+        hide_at = self.html.index("transitBox.hidden = true;", submit_at)
+        self.assertLess(hide_at, self.html.index("var body = {", submit_at))
+        self.assertLess(self.html.index('transitLink.removeAttribute("href");', submit_at), self.html.index("var body = {", submit_at))
 
     def test_recent_destination_pick_does_not_submit(self):
         self.assertIn("destinationInput.value = text;", self.html)
