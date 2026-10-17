@@ -26,13 +26,11 @@ CITY_HALL = [
 ]
 
 
-def osrm(duration, distance, summary=""):
-    return {
-        "code": "Ok",
-        "routes": [
-            {"duration": duration, "distance": distance, "legs": [{"summary": summary, "steps": []}]}
-        ],
-    }
+def osrm(duration, distance, summary="", geometry=None):
+    route = {"duration": duration, "distance": distance, "legs": [{"summary": summary, "steps": []}]}
+    if geometry is not None:
+        route["geometry"] = geometry
+    return {"code": "Ok", "routes": [route]}
 
 
 class FakeResponse:
@@ -124,17 +122,41 @@ class GeocodeTest(unittest.TestCase):
 
 
 class RouteTest(unittest.TestCase):
-    def test_coordinates_are_longitude_first_and_overview_false(self):
+    def test_coordinates_are_longitude_first_and_geometry_requested(self):
         provider, opener, _ = make_provider(osrm(10, 20))
         provider.route(ORIGIN, DESTINATION, "walk")
         request, timeout = opener.requests[0]
         self.assertEqual(
             request.full_url,
             "https://routing.openstreetmap.de/routed-foot/route/v1/driving/"
-            "126.9,37.5;127.0,37.6?overview=false",
+            "126.9,37.5;127.0,37.6?overview=simplified&geometries=geojson",
         )
         self.assertEqual(request.get_header("User-agent"), USER_AGENT)
         self.assertEqual(timeout, TIMEOUT_SECONDS)
+
+    def test_geometry_is_converted_to_lat_lon(self):
+        geometry = {"type": "LineString", "coordinates": [[126.9, 37.5], [127.0, 37.6]]}
+        provider, _, _ = make_provider(osrm(10, 20, geometry=geometry))
+        option = provider.route(ORIGIN, DESTINATION, "walk")
+        self.assertEqual(option.geometry, [[37.5, 126.9], [37.6, 127.0]])
+
+    def test_missing_geometry_is_empty(self):
+        provider, _, _ = make_provider(osrm(10, 20))
+        self.assertEqual(provider.route(ORIGIN, DESTINATION, "walk").geometry, [])
+
+    def test_malformed_geometry_is_empty_and_route_is_kept(self):
+        bad = [
+            "line",
+            {"coordinates": "x"},
+            {"coordinates": [[126.9]]},
+            {"coordinates": [["a", "b"]]},
+            {"coordinates": [[126.9, 137.5]]},
+        ]
+        for geometry in bad:
+            provider, _, _ = make_provider(osrm(10, 20, geometry=geometry))
+            option = provider.route(ORIGIN, DESTINATION, "walk")
+            self.assertEqual(option.geometry, [])
+            self.assertEqual(option.duration_seconds, 10)
 
     def test_service_name_per_mode(self):
         provider, opener, _ = make_provider(osrm(10, 20), osrm(10, 20))

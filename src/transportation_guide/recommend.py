@@ -15,6 +15,8 @@ class Unavailable:
 class RecommendResult:
     routes: list[RouteOption]
     unavailable: list[Unavailable]
+    origin: Place | None = None
+    destination: Place | None = None
 
 
 def recommend(
@@ -58,4 +60,4 @@ def recommend(
 
     options.sort(key=lambda option: option.duration_seconds)
     options[0] = replace(options[0], fastest=True)
-    return RecommendResult(options, unavailable)
+    return RecommendResult(options, unavailable, origin, target)

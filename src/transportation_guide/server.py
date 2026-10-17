@@ -75,6 +75,8 @@ def handle_recommend(provider: Provider, params: dict) -> tuple[int, dict]:
         return 200, {
             "routes": [asdict(option) for option in result.routes],
             "unavailable": [asdict(item) for item in result.unavailable],
+            "origin": asdict(result.origin) if result.origin else None,
+            "destination": asdict(result.destination) if result.destination else None,
         }
     except ValueError as error:
         return 400, {"error": "invalid_input", "message": str(error)}

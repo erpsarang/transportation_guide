@@ -32,6 +32,26 @@ class StaticPageTest(unittest.TestCase):
     def test_unavailable_box_hidden_on_submit(self):
         self.assertIn("unavailableBox.hidden = true;", self.html)
 
+    def test_map_uses_osm_tiles_without_external_library(self):
+        self.assertIn("https://tile.openstreetmap.org/{z}/{x}/{y}.png", self.html)
+        self.assertNotIn("leaflet", self.html.lower())
+        self.assertNotIn("<script src", self.html)
+
+    def test_map_attribution_is_always_in_markup(self):
+        self.assertIn("© OpenStreetMap contributors", self.html)
+        self.assertIn('id="map-box" hidden', self.html)
+
+    def test_map_failure_notices_and_isolation(self):
+        self.assertIn("지도 이미지를 불러오지 못했습니다", self.html)
+        self.assertIn("지도를 표시하지 못했습니다", self.html)
+        self.assertIn("img.onerror", self.html)
+        self.assertLess(self.html.index("render(result.data.routes);"), self.html.index("showMap(result.data);"))
+
+    def test_map_reset_on_submit_and_selection(self):
+        self.assertIn("clearMap();", self.html)
+        self.assertIn("selectMode(route.mode)", self.html)
+        self.assertIn("찾은 목적지", self.html)
+
 
 if __name__ == "__main__":
     unittest.main()

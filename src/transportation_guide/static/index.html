@@ -17,6 +17,13 @@
   li { border: 1px solid #ccc; border-radius: 6px; padding: 0.75rem; margin-top: 0.5rem; }
   .badge { background: #1565c0; color: #fff; border-radius: 4px; padding: 0 0.4rem; margin-left: 0.5rem; font-size: 0.85em; }
   .unavailable-title { margin: 1.5rem 0 0; font-size: 0.85rem; font-weight: normal; color: #757575; }
+  li.route { cursor: pointer; }
+  li.route.selected { border-color: #1565c0; box-shadow: 0 0 0 2px #1565c0; }
+  .map-name { margin-top: 1rem; font-weight: bold; }
+  .map { position: relative; width: 100%; height: 320px; overflow: hidden; background: #e0e0e0; border: 1px solid #ccc; box-sizing: border-box; margin-top: 0.5rem; }
+  .map img { position: absolute; width: 256px; height: 256px; max-width: none; }
+  .map svg { position: absolute; left: 0; top: 0; }
+  .map-attr { font-size: 0.75rem; color: #616161; margin-top: 0.25rem; }
   [hidden] { display: none; }
 </style>
 </head>
@@ -40,6 +47,12 @@
 <div id="location-status" class="notice" hidden></div>
 <div id="busy" class="notice" role="status" hidden></div>
 <div id="error" class="error" role="alert" hidden></div>
+<div id="map-box" hidden>
+  <div id="map-name" class="map-name"></div>
+  <div id="map" class="map"></div>
+  <div id="map-note" class="notice" role="status" hidden></div>
+  <div class="map-attr">© OpenStreetMap contributors (<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">저작권 안내</a>)</div>
+</div>
 <ul id="results"></ul>
 <div id="unavailable-box" hidden>
   <h2 class="unavailable-title">결과를 받지 못한 이동 수단</h2>
@@ -162,9 +175,218 @@
         summary.textContent = route.summary;
         item.appendChild(summary);
       }
+      item.className = "route";
+      item.setAttribute("data-mode", route.mode);
+      item.setAttribute("tabindex", "0");
+      item.setAttribute("role", "button");
+      if (MODE_COLORS[route.mode]) item.style.borderLeft = "6px solid " + MODE_COLORS[route.mode];
+      item.addEventListener("click", function () { selectMode(route.mode); });
+      item.addEventListener("keydown", function (event) {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          selectMode(route.mode);
+        }
+      });
       results.appendChild(item);
     });
   }
+
+  var MODE_COLORS = { walk: "#2e7d32", bike: "#ef6c00", car: "#6a1b9a" };
+  var TILE_URL = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
+  var TILE_SIZE = 256;
+  var MAP_PADDING = 40;
+  var SVG_NS = "http://www.w3.org/2000/svg";
+  var mapBox = document.getElementById("map-box");
+  var mapEl = document.getElementById("map");
+  var mapNote = document.getElementById("map-note");
+  var mapName = document.getElementById("map-name");
+  var mapState = null;
+  var selectedMode = null;
+
+  function clearMap() {
+    mapState = null;
+    selectedMode = null;
+    mapEl.textContent = "";
+    mapEl.hidden = false;
+    mapNote.textContent = "";
+    mapNote.hidden = true;
+    mapName.textContent = "";
+    mapBox.hidden = true;
+  }
+
+  function mapMessage(text) {
+    mapNote.textContent = text;
+    mapNote.hidden = false;
+  }
+
+  function isPoint(lat, lon) {
+    return typeof lat === "number" && typeof lon === "number" && isFinite(lat) && isFinite(lon) &&
+      Math.abs(lat) <= 85 && Math.abs(lon) <= 180;
+  }
+
+  function project(lat, lon, z) {
+    var scale = TILE_SIZE * Math.pow(2, z);
+    var rad = lat * Math.PI / 180;
+    return {
+      x: (lon + 180) / 360 * scale,
+      y: (1 - Math.log(Math.tan(rad) + 1 / Math.cos(rad)) / Math.PI) / 2 * scale
+    };
+  }
+
+  function validGeometry(geometry) {
+    if (!Array.isArray(geometry) || geometry.length < 2) return null;
+    for (var i = 0; i < geometry.length; i++) {
+      var p = geometry[i];
+      if (!Array.isArray(p) || !isPoint(p[0], p[1])) return null;
+    }
+    return geometry;
+  }
+
+  function svgElement(name, attrs) {
+    var el = document.createElementNS(SVG_NS, name);
+    Object.keys(attrs).forEach(function (key) { el.setAttribute(key, attrs[key]); });
+    return el;
+  }
+
+  function drawOverlay() {
+    var view = mapState.view;
+    var svg = mapState.svg;
+    svg.textContent = "";
+    function toXY(lat, lon) {
+      var p = project(lat, lon, view.z);
+      return { x: p.x - view.left, y: p.y - view.top };
+    }
+    var lines = mapState.lines.slice().sort(function (a, b) {
+      return (a.mode === selectedMode ? 1 : 0) - (b.mode === selectedMode ? 1 : 0);
+    });
+    lines.forEach(function (line) {
+      var selected = line.mode === selectedMode;
+      var width = selected ? 8 : (line.fastest ? 6 : 4);
+      svg.appendChild(svgElement("polyline", {
+        points: line.points.map(function (p) {
+          var xy = toXY(p[0], p[1]);
+          return xy.x.toFixed(1) + "," + xy.y.toFixed(1);
+        }).join(" "),
+        fill: "none",
+        stroke: MODE_COLORS[line.mode] || "#424242",
+        "stroke-width": width,
+        "stroke-linejoin": "round",
+        "stroke-linecap": "round",
+        opacity: selected ? 1 : 0.4
+      }));
+    });
+    [[mapState.origin, "출발", "#1565c0"], [mapState.destination, "도착", "#c62828"]].forEach(function (m) {
+      var xy = toXY(m[0].lat, m[0].lon);
+      svg.appendChild(svgElement("circle", {
+        cx: xy.x, cy: xy.y, r: 8, fill: m[2], stroke: "#fff", "stroke-width": 3
+      }));
+      var label = svgElement("text", {
+        x: xy.x + 12, y: xy.y - 10, "font-size": 13, "font-weight": "bold", fill: m[2],
+        stroke: "#fff", "stroke-width": 3, "paint-order": "stroke"
+      });
+      label.textContent = m[1];
+      svg.appendChild(label);
+    });
+  }
+
+  function drawMap() {
+    var w = mapEl.clientWidth || 320;
+    var h = mapEl.clientHeight || 320;
+    var coords = [[mapState.origin.lat, mapState.origin.lon], [mapState.destination.lat, mapState.destination.lon]];
+    mapState.lines.forEach(function (line) { coords = coords.concat(line.points); });
+    var z = 17;
+    var box;
+    for (; z > 0; z--) {
+      box = null;
+      for (var i = 0; i < coords.length; i++) {
+        var p = project(coords[i][0], coords[i][1], z);
+        if (!box) box = { minX: p.x, maxX: p.x, minY: p.y, maxY: p.y };
+        box.minX = Math.min(box.minX, p.x);
+        box.maxX = Math.max(box.maxX, p.x);
+        box.minY = Math.min(box.minY, p.y);
+        box.maxY = Math.max(box.maxY, p.y);
+      }
+      if (box.maxX - box.minX <= w - 2 * MAP_PADDING && box.maxY - box.minY <= h - 2 * MAP_PADDING) break;
+    }
+    var left = (box.minX + box.maxX) / 2 - w / 2;
+    var top = (box.minY + box.maxY) / 2 - h / 2;
+    var n = Math.pow(2, z);
+    mapEl.textContent = "";
+    var failed = false;
+    for (var tx = Math.floor(left / TILE_SIZE); tx <= Math.floor((left + w) / TILE_SIZE); tx++) {
+      for (var ty = Math.floor(top / TILE_SIZE); ty <= Math.floor((top + h) / TILE_SIZE); ty++) {
+        if (ty < 0 || ty >= n) continue;
+        var img = document.createElement("img");
+        img.alt = "";
+        img.style.left = Math.round(tx * TILE_SIZE - left) + "px";
+        img.style.top = Math.round(ty * TILE_SIZE - top) + "px";
+        img.onerror = function () {
+          if (failed) return;
+          failed = true;
+          mapMessage("지도 이미지를 불러오지 못했습니다. 경로 목록은 그대로 볼 수 있습니다.");
+        };
+        img.src = TILE_URL.replace("{z}", z).replace("{x}", ((tx % n) + n) % n).replace("{y}", ty);
+        mapEl.appendChild(img);
+      }
+    }
+    var svg = svgElement("svg", { width: w, height: h, viewBox: "0 0 " + w + " " + h });
+    mapEl.appendChild(svg);
+    mapState.svg = svg;
+    mapState.view = { z: z, left: left, top: top };
+    drawOverlay();
+  }
+
+  function selectMode(mode) {
+    selectedMode = mode;
+    var items = results.children;
+    for (var i = 0; i < items.length; i++) {
+      items[i].classList.toggle("selected", items[i].getAttribute("data-mode") === mode);
+    }
+    if (mapState && mapState.svg) {
+      try { drawOverlay(); } catch (e) {}
+    }
+  }
+
+  function showMap(data) {
+    try {
+      mapBox.hidden = false;
+      mapNote.hidden = true;
+      var origin = data.origin;
+      var destination = data.destination;
+      if (!origin || !destination || !isPoint(origin.lat, origin.lon) || !isPoint(destination.lat, destination.lon)) {
+        mapEl.hidden = true;
+        mapMessage("출발지나 목적지 좌표가 없어 지도를 표시하지 못했습니다.");
+        return;
+      }
+      mapEl.hidden = false;
+      mapName.textContent = "찾은 목적지: " + (destination.name || "");
+      var lines = [];
+      var fastestMode = null;
+      data.routes.forEach(function (route) {
+        if (route.fastest || (!fastestMode && fastestMode !== 0)) {
+          if (route.fastest || !fastestMode) fastestMode = route.mode;
+        }
+        var points = validGeometry(route.geometry);
+        if (points) lines.push({ mode: route.mode, fastest: !!route.fastest, points: points });
+      });
+      mapState = { origin: origin, destination: destination, lines: lines, svg: null, view: null };
+      selectedMode = fastestMode;
+      if (!lines.length) mapMessage("경로 좌표를 받지 못해 경로선은 표시하지 못했습니다.");
+      drawMap();
+      selectMode(fastestMode);
+    } catch (e) {
+      mapState = null;
+      mapEl.hidden = true;
+      mapBox.hidden = false;
+      mapMessage("지도를 표시하지 못했습니다. 경로 목록은 그대로 볼 수 있습니다.");
+    }
+  }
+
+  window.addEventListener("resize", function () {
+    if (mapState && !mapBox.hidden) {
+      try { drawMap(); } catch (e) {}
+    }
+  });
 
   function renderUnavailable(items) {
     unavailableList.textContent = "";
@@ -182,6 +404,7 @@
     results.textContent = "";
     unavailableList.textContent = "";
     unavailableBox.hidden = true;
+    clearMap();
     var body = { destination: document.getElementById("destination").value };
     if (position && originBox.hidden) {
       body.lat = position.lat;
@@ -237,6 +460,7 @@
       } else {
         render(result.data.routes);
         renderUnavailable(result.data.unavailable || []);
+        showMap(result.data);
       }
     }).catch(function () {
       showError("서버에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.");
