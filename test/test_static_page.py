@@ -52,6 +52,37 @@ class StaticPageTest(unittest.TestCase):
         self.assertIn("selectMode(route.mode)", self.html)
         self.assertIn("찾은 목적지", self.html)
 
+    def test_recent_destinations_markup(self):
+        self.assertIn('id="recent-box" hidden', self.html)
+        self.assertIn("최근 목적지", self.html)
+        self.assertIn('id="recent-clear"', self.html)
+        self.assertIn("지우기", self.html)
+        self.assertLess(self.html.index('id="destination"'), self.html.index('id="recent-box"'))
+
+    def test_recent_destinations_storage(self):
+        self.assertIn('"transportation_guide_recent_destinations"', self.html)
+        self.assertIn("var RECENT_MAX = 10;", self.html)
+        self.assertIn("slice(0, RECENT_MAX)", self.html)
+        self.assertIn("Array.isArray(parsed)", self.html)
+        self.assertIn('typeof value === "string"', self.html)
+        self.assertIn("try { localStorage.setItem(RECENT_KEY", self.html)
+        self.assertIn("try { localStorage.removeItem(RECENT_KEY)", self.html)
+        self.assertIn("try {\n      var parsed = JSON.parse(localStorage.getItem(RECENT_KEY)", self.html)
+
+    def test_recent_destinations_saved_only_on_success(self):
+        render_at = self.html.index("render(result.data.routes);")
+        save_at = self.html.index("saveRecent(requestedDestination);")
+        self.assertLess(render_at, save_at)
+        self.assertLess(save_at, self.html.index("showMap(result.data);"))
+        self.assertLess(self.html.index("showError(\"표시할 경로가 없습니다"), save_at)
+        self.assertEqual(self.html.count("saveRecent(requestedDestination)"), 1)
+
+    def test_recent_destination_pick_does_not_submit(self):
+        self.assertIn("destinationInput.value = text;", self.html)
+        self.assertIn("button.textContent = text;", self.html)
+        self.assertNotIn("requestSubmit", self.html)
+        self.assertNotIn(".submit()", self.html)
+
 
 if __name__ == "__main__":
     unittest.main()

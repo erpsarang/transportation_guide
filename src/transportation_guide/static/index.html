@@ -24,6 +24,8 @@
   .map img { position: absolute; width: 256px; height: 256px; max-width: none; }
   .map svg { position: absolute; left: 0; top: 0; }
   .map-attr { font-size: 0.75rem; color: #616161; margin-top: 0.25rem; }
+  .recent-title { margin: 1rem 0 0; font-size: 0.9rem; font-weight: bold; }
+  #recent-list button { margin: 0.25rem 0.25rem 0 0; }
   [hidden] { display: none; }
 </style>
 </head>
@@ -32,6 +34,11 @@
 <form id="form">
   <label for="destination">목적지 주소</label>
   <input id="destination" name="destination" required autocomplete="off">
+  <div id="recent-box" hidden>
+    <h2 class="recent-title">최근 목적지</h2>
+    <div id="recent-list"></div>
+    <button type="button" id="recent-clear">지우기</button>
+  </div>
   <div id="origin-box" hidden>
     <label for="origin-address">출발지 주소</label>
     <input id="origin-address" name="origin_address" autocomplete="off">
@@ -388,6 +395,58 @@
     }
   });
 
+  var RECENT_KEY = "transportation_guide_recent_destinations";
+  var RECENT_MAX = 10;
+  var destinationInput = document.getElementById("destination");
+  var recentBox = document.getElementById("recent-box");
+  var recentList = document.getElementById("recent-list");
+  var recentClear = document.getElementById("recent-clear");
+
+  function readRecent() {
+    try {
+      var parsed = JSON.parse(localStorage.getItem(RECENT_KEY) || "[]");
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(function (value) {
+        return typeof value === "string" && value.trim() !== "";
+      }).slice(0, RECENT_MAX);
+    } catch (e) { return []; }
+  }
+
+  function writeRecent(list) {
+    try { localStorage.setItem(RECENT_KEY, JSON.stringify(list)); } catch (e) {}
+  }
+
+  function renderRecent() {
+    var list = readRecent();
+    recentList.textContent = "";
+    list.forEach(function (text) {
+      var button = document.createElement("button");
+      button.type = "button";
+      button.textContent = text;
+      button.addEventListener("click", function () {
+        destinationInput.value = text;
+        destinationInput.focus();
+      });
+      recentList.appendChild(button);
+    });
+    recentBox.hidden = list.length === 0;
+  }
+
+  function saveRecent(text) {
+    if (!text) return;
+    var list = readRecent().filter(function (value) { return value !== text; });
+    list.unshift(text);
+    writeRecent(list.slice(0, RECENT_MAX));
+    renderRecent();
+  }
+
+  recentClear.addEventListener("click", function () {
+    try { localStorage.removeItem(RECENT_KEY); } catch (e) {}
+    renderRecent();
+  });
+
+  renderRecent();
+
   function renderUnavailable(items) {
     unavailableList.textContent = "";
     items.forEach(function (entry) {
@@ -406,6 +465,7 @@
     unavailableBox.hidden = true;
     clearMap();
     var body = { destination: document.getElementById("destination").value };
+    var requestedDestination = body.destination.trim();
     if (position && originBox.hidden) {
       body.lat = position.lat;
       body.lon = position.lon;
@@ -459,6 +519,7 @@
         showError("표시할 경로가 없습니다. 다시 시도해 주세요.");
       } else {
         render(result.data.routes);
+        saveRecent(requestedDestination);
         renderUnavailable(result.data.unavailable || []);
         showMap(result.data);
       }
