@@ -67,19 +67,6 @@ class Provider(Protocol):
 OSRM_SERVICES = {WALK: "routed-foot", BIKE: "routed-bike", CAR: "routed-car"}
 
 
-def _describe(duration_seconds: int, distance_meters: int) -> str:
-    minutes = max(1, round(duration_seconds / 60))
-    if minutes < 60:
-        time_text = "%d분" % minutes
-    else:
-        time_text = "%d시간 %d분" % (minutes // 60, minutes % 60)
-    if distance_meters < 1000:
-        distance_text = "%dm" % distance_meters
-    else:
-        distance_text = "%.1fkm" % (distance_meters / 1000)
-    return "약 %s, %s" % (time_text, distance_text)
-
-
 class OsmProvider:
     """Nominatim으로 주소를 좌표로 바꾸고 OSRM으로 경로를 조회한다.
 
@@ -164,4 +151,4 @@ class OsmProvider:
                     summary = name.strip()
         except (KeyError, IndexError, TypeError, ValueError) as error:
             raise ServiceUnavailable("경로 응답 형식이 올바르지 않습니다.") from error
-        return RouteOption(mode, duration, distance, summary or _describe(duration, distance))
+        return RouteOption(mode, duration, distance, summary)

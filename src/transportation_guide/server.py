@@ -1,6 +1,8 @@
 """http.server로 정적 화면과 JSON API를 제공한다."""
 
+import hmac
 import json
+import os
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -18,6 +20,28 @@ from .recommend import recommend
 
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_BODY_BYTES = 16 * 1024
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8000
+ACCESS_HEADER = "X-Access-Code"
+
+
+def read_settings(environ) -> tuple[str, int, str | None]:
+    """환경에서 (host, port, access_code)를 읽는다. PORT가 올바르지 않으면 이유를 알리고 종료한다."""
+    host = (environ.get("HOST") or "").strip() or DEFAULT_HOST
+    raw_port = (environ.get("PORT") or "").strip()
+    port = DEFAULT_PORT
+    if raw_port:
+        if not (raw_port.isascii() and raw_port.isdigit()) or int(raw_port) > 65535:
+            raise SystemExit("PORT는 0~65535 사이의 정수여야 합니다.")
+        port = int(raw_port)
+    return host, port, environ.get("ACCESS_CODE") or None
+
+
+def is_authorized(access_code: str | None, given: str | None) -> bool:
+    """접근 코드가 설정되지 않았으면 통과, 설정되었으면 시간 차로 추측되지 않게 비교한다."""
+    if not access_code:
+        return True
+    return hmac.compare_digest((given or "").encode("utf-8"), access_code.encode("utf-8"))
 
 
 def _parse_origin(params: dict) -> Place | None:
@@ -76,7 +100,7 @@ def handle_recommend(provider: Provider, params: dict) -> tuple[int, dict]:
         }
 
 
-def make_handler(provider: Provider):
+def make_handler(provider: Provider, access_code: str | None = None):
     class Handler(BaseHTTPRequestHandler):
         def _send(self, status: int, body: bytes, content_type: str) -> None:
             self.send_response(status)
@@ -89,6 +113,18 @@ def make_handler(provider: Provider):
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self._send(status, body, "application/json; charset=utf-8")
 
+        def _authorized(self) -> bool:
+            if is_authorized(access_code, self.headers.get(ACCESS_HEADER)):
+                return True
+            self._send_json(
+                401,
+                {
+                    "error": "unauthorized",
+                    "message": "접근 코드가 필요하거나 올바르지 않습니다. 접근 코드를 입력해 주세요.",
+                },
+            )
+            return False
+
         def do_GET(self) -> None:
             url = urlparse(self.path)
             if url.path in ("/", "/index.html"):
@@ -99,6 +135,8 @@ def make_handler(provider: Provider):
                     return
                 self._send(200, body, "text/html; charset=utf-8")
             elif url.path == "/api/recommend":
+                if not self._authorized():
+                    return
                 query = {key: values[0] for key, values in parse_qs(url.query).items()}
                 self._send_json(*handle_recommend(provider, query))
             else:
@@ -107,6 +145,8 @@ def make_handler(provider: Provider):
         def do_POST(self) -> None:
             if urlparse(self.path).path != "/api/recommend":
                 self._send_json(404, {"error": "not_found", "message": "찾을 수 없는 주소입니다."})
+                return
+            if not self._authorized():
                 return
             try:
                 length = int(self.headers.get("Content-Length") or 0)
@@ -126,14 +166,23 @@ def make_handler(provider: Provider):
     return Handler
 
 
-def make_server(provider: Provider | None = None, host: str = "127.0.0.1", port: int = 8000):
-    """provider를 주입할 수 있는 서버를 만든다. 생략하면 OpenStreetMap 기반 provider를 쓴다."""
-    return ThreadingHTTPServer((host, port), make_handler(provider or OsmProvider()))
+def make_server(
+    provider: Provider | None = None,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+    access_code: str | None = None,
+):
+    """provider를 주입할 수 있는 서버를 만든다. 생략하면 OpenStreetMap 기반 provider를 쓴다.
+
+    access_code를 주면 /api/recommend는 같은 코드를 X-Access-Code 헤더로 보낸 요청만 받는다.
+    """
+    return ThreadingHTTPServer((host, port), make_handler(provider or OsmProvider(), access_code))
 
 
 def main() -> None:
-    server = make_server()
-    print("http://127.0.0.1:8000 에서 실행 중입니다. 종료는 Ctrl+C.")
+    host, port, access_code = read_settings(os.environ)
+    server = make_server(host=host, port=port, access_code=access_code)
+    print("http://%s:%d 에서 실행 중입니다. 종료는 Ctrl+C." % (host, server.server_address[1]))
     try:
         server.serve_forever()
     except KeyboardInterrupt:

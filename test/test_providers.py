@@ -153,10 +153,10 @@ class RouteTest(unittest.TestCase):
         self.assertEqual((car.duration_seconds, car.distance_meters), (260, 3076))
         self.assertIsInstance(walk.duration_seconds, int)
 
-    def test_empty_summary_becomes_sentence(self):
+    def test_empty_summary_stays_empty(self):
         provider, _, _ = make_provider(osrm(587.8, 1697.8))
         option = provider.route(ORIGIN, DESTINATION, "bike")
-        self.assertEqual(option.summary, "약 10분, 1.7km")
+        self.assertEqual(option.summary, "")
 
     def test_road_name_summary_is_used(self):
         provider, _, _ = make_provider(osrm(300, 900, "세종대로"))
