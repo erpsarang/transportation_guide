@@ -12,7 +12,7 @@ from transportation_guide.providers import (
     RouteOption,
     ServiceUnavailable,
 )
-from transportation_guide.server import make_server
+from transportation_guide.server import make_server, read_settings
 
 
 class FakeProvider:
@@ -149,6 +149,82 @@ class ServerTest(unittest.TestCase):
     def test_unknown_path(self):
         status, _ = self.send(urllib.request.Request(self.base + "/nope"))
         self.assertEqual(status, 404)
+
+
+class SettingsTest(unittest.TestCase):
+    def test_defaults(self):
+        self.assertEqual(read_settings({}), ("127.0.0.1", 8000, None))
+
+    def test_host_port_and_access_code_from_environment(self):
+        env = {"HOST": "0.0.0.0", "PORT": "10000", "ACCESS_CODE": "abc"}
+        self.assertEqual(read_settings(env), ("0.0.0.0", 10000, "abc"))
+
+    def test_empty_values_are_unset(self):
+        self.assertEqual(read_settings({"HOST": "", "PORT": "", "ACCESS_CODE": ""}), ("127.0.0.1", 8000, None))
+
+    def test_invalid_port_stops_startup(self):
+        for value in ("abc", "-1", "70000", "80.5"):
+            with self.assertRaises(SystemExit):
+                read_settings({"PORT": value})
+
+
+class AccessCodeTest(unittest.TestCase):
+    CODE = "s3cret-code"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = make_server(FakeProvider(), port=0, access_code=cls.CODE)
+        cls.base = "http://127.0.0.1:%d" % cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join()
+
+    def request(self, code=None, method="POST"):
+        headers = {"Content-Type": "application/json"}
+        if code is not None:
+            headers["X-Access-Code"] = code
+        payload = {"destination": "시청", "lat": 37.0, "lon": 127.0}
+        if method == "POST":
+            request = urllib.request.Request(
+                self.base + "/api/recommend",
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+            )
+        else:
+            url = self.base + "/api/recommend?destination=%EC%8B%9C%EC%B2%AD&lat=37&lon=127"
+            request = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, response.read().decode("utf-8")
+        except urllib.error.HTTPError as error:
+            return error.code, error.read().decode("utf-8")
+
+    def test_missing_code_is_unauthorized(self):
+        for method in ("POST", "GET"):
+            status, text = self.request(method=method)
+            self.assertEqual(status, 401)
+            self.assertEqual(json.loads(text)["error"], "unauthorized")
+            self.assertNotIn(self.CODE, text)
+
+    def test_wrong_code_is_unauthorized(self):
+        status, text = self.request("wrong")
+        self.assertEqual(status, 401)
+        self.assertNotIn(self.CODE, text)
+
+    def test_correct_code_gives_result(self):
+        for method in ("POST", "GET"):
+            status, text = self.request(self.CODE, method=method)
+            self.assertEqual(status, 200)
+            self.assertEqual(len(json.loads(text)["routes"]), 3)
+
+    def test_index_html_is_public(self):
+        with urllib.request.urlopen(self.base + "/") as response:
+            self.assertEqual(response.status, 200)
 
 
 if __name__ == "__main__":

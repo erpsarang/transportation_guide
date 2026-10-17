@@ -26,9 +26,14 @@
     <label for="origin-address">출발지 주소</label>
     <input id="origin-address" name="origin_address" autocomplete="off">
   </div>
+  <div id="access-box" hidden>
+    <label for="access-code">접근 코드</label>
+    <input id="access-code" name="access_code" type="password" autocomplete="off">
+  </div>
   <button type="submit" id="submit">검색</button>
 </form>
 <div id="location-status" class="notice" hidden></div>
+<div id="busy" class="notice" role="status" hidden></div>
 <div id="error" class="error" role="alert" hidden></div>
 <ul id="results"></ul>
 <ul id="unavailable"></ul>
@@ -42,7 +47,13 @@
   var errorBox = document.getElementById("error");
   var results = document.getElementById("results");
   var unavailableList = document.getElementById("unavailable");
-  var FETCH_TIMEOUT_MS = 60000;
+  var FETCH_TIMEOUT_MS = 90000;
+  var WAKE_NOTICE_MS = 15000;
+  var ACCESS_KEY = "transportation_guide_access_code";
+  var accessBox = document.getElementById("access-box");
+  var accessInput = document.getElementById("access-code");
+  var busyBox = document.getElementById("busy");
+  var wakeTimer = null;
   var submit = document.getElementById("submit");
   var position = null;
 
@@ -77,6 +88,32 @@
     errorBox.hidden = false;
   }
 
+  function storedCode() {
+    try { return localStorage.getItem(ACCESS_KEY) || ""; } catch (e) { return ""; }
+  }
+
+  function storeCode(code) {
+    try { localStorage.setItem(ACCESS_KEY, code); } catch (e) {}
+  }
+
+  function forgetCode() {
+    try { localStorage.removeItem(ACCESS_KEY); } catch (e) {}
+  }
+
+  function showBusy() {
+    busyBox.textContent = "검색 중입니다.";
+    busyBox.hidden = false;
+    clearTimeout(wakeTimer);
+    wakeTimer = setTimeout(function () {
+      busyBox.textContent = "서버를 깨우는 중입니다. 최대 1분쯤 걸릴 수 있습니다.";
+    }, WAKE_NOTICE_MS);
+  }
+
+  function hideBusy() {
+    clearTimeout(wakeTimer);
+    busyBox.hidden = true;
+  }
+
   function formatDuration(seconds) {
     var minutes = Math.max(1, Math.round(seconds / 60));
     if (minutes < 60) return minutes + "분";
@@ -105,9 +142,11 @@
       info.textContent = "예상 소요 시간 " + formatDuration(route.duration_seconds) +
         " · 거리 " + formatDistance(route.distance_meters);
       item.appendChild(info);
-      var summary = document.createElement("div");
-      summary.textContent = route.summary;
-      item.appendChild(summary);
+      if (route.summary) {
+        var summary = document.createElement("div");
+        summary.textContent = route.summary;
+        item.appendChild(summary);
+      }
       results.appendChild(item);
     });
   }
@@ -141,18 +180,30 @@
       return;
     }
     submit.disabled = true;
+    showBusy();
+    var code = accessInput.value.trim() || storedCode();
+    var headers = { "Content-Type": "application/json" };
+    if (code) headers["X-Access-Code"] = code;
     var controller = new AbortController();
     var timer = setTimeout(function () { controller.abort(); }, FETCH_TIMEOUT_MS);
     fetch("/api/recommend", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: headers,
       body: JSON.stringify(body),
       signal: controller.signal
     }).then(function (response) {
       return response.json().then(function (data) {
-        return { ok: response.ok, data: data };
+        return { ok: response.ok, status: response.status, data: data };
       });
     }).then(function (result) {
+      if (result.status === 401) {
+        forgetCode();
+        accessInput.value = "";
+        accessBox.hidden = false;
+        showError("접근 코드가 필요하거나 올바르지 않습니다. 접근 코드를 다시 입력해 주세요.");
+        return;
+      }
+      if (code) storeCode(code);
       if (!result.ok) {
         showError(result.data.message || "문제가 발생했습니다. 다시 시도해 주세요.");
       } else if (!result.data.routes || !result.data.routes.length) {
@@ -165,6 +216,7 @@
       showError("서버에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.");
     }).then(function () {
       clearTimeout(timer);
+      hideBusy();
       submit.disabled = false;
     });
   });
