@@ -66,6 +66,9 @@
   <div class="map-attr">© OpenStreetMap contributors (<a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">저작권 안내</a>)</div>
 </div>
 <ul id="results"></ul>
+<div id="transit-box" hidden>
+  <a id="transit-link" target="_blank" rel="noopener"></a>
+</div>
 <div id="unavailable-box" hidden>
   <h2 class="unavailable-title">결과를 받지 못한 이동 수단</h2>
   <ul id="unavailable"></ul>
@@ -81,6 +84,8 @@
   var results = document.getElementById("results");
   var unavailableList = document.getElementById("unavailable");
   var unavailableBox = document.getElementById("unavailable-box");
+  var transitBox = document.getElementById("transit-box");
+  var transitLink = document.getElementById("transit-link");
   var FETCH_TIMEOUT_MS = 90000;
   var WAKE_NOTICE_MS = 15000;
   var ACCESS_KEY = "transportation_guide_access_code";
@@ -180,6 +185,26 @@
     var to = kakaoPoint(destination, "목적지");
     if (!from || !to) return null;
     return "https://map.kakao.com/link/by/" + KAKAO_MODES[mode] + "/" + from + "/" + to;
+  }
+
+  var TRANSIT_LINK_TEXT = "대중교통은 카카오맵에서 길안내";
+
+  function kakaoTransitUrl(origin, destination) {
+    var from = kakaoPoint(origin, "현재 위치");
+    var to = kakaoPoint(destination, "목적지");
+    if (!from || !to) return null;
+    return "https://map.kakao.com/link/by/traffic/" + from + "/" + to;
+  }
+
+  function renderTransit(data) {
+    var url = data ? kakaoTransitUrl(data.origin, data.destination) : null;
+    if (!url) {
+      transitBox.hidden = true;
+      return;
+    }
+    transitLink.textContent = TRANSIT_LINK_TEXT;
+    transitLink.href = url;
+    transitBox.hidden = false;
   }
 
   function render(routes, data) {
@@ -548,6 +573,9 @@
     results.textContent = "";
     unavailableList.textContent = "";
     unavailableBox.hidden = true;
+    transitBox.hidden = true;
+    transitLink.removeAttribute("href");
+    transitLink.textContent = "";
     clearMap();
     var body = { destination: document.getElementById("destination").value };
     var requestedDestination = body.destination.trim();
@@ -606,6 +634,7 @@
         showError("표시할 경로가 없습니다. 다시 시도해 주세요.");
       } else {
         render(result.data.routes, result.data);
+        renderTransit(result.data);
         saveRecent(requestedDestination);
         saveRecentOrigin(requestedOrigin);
         renderUnavailable(result.data.unavailable || []);
