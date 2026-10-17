@@ -11,11 +11,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-OSRM_URL = "https://routing.openstreetmap.de/{service}/route/v1/driving/{coordinates}?overview=false"
+OSRM_URL = "https://routing.openstreetmap.de/{service}/route/v1/driving/{coordinates}?overview=simplified&geometries=geojson"
 USER_AGENT = "transportation_guide/0.1"
 TIMEOUT_SECONDS = 10
 GEOCODE_INTERVAL_SECONDS = 1.0
@@ -52,6 +52,7 @@ class RouteOption:
     distance_meters: int
     summary: str
     fastest: bool = False
+    geometry: list[list[float]] = field(default_factory=list)
 
 
 class Provider(Protocol):
@@ -62,6 +63,28 @@ class Provider(Protocol):
     def route(self, origin: Place, destination: Place, mode: str) -> RouteOption:
         """경로를 조회한다. 없으면 NoRouteFound, 장애면 ServiceUnavailable."""
         ...
+
+
+def _parse_geometry(route: dict) -> list[list[float]]:
+    """OSRM geojson 좌표([lon, lat])를 [lat, lon] 목록으로 바꾼다. 없거나 형식이 틀리면 빈 목록."""
+    geometry = route.get("geometry")
+    if not isinstance(geometry, dict):
+        return []
+    coordinates = geometry.get("coordinates")
+    if not isinstance(coordinates, list):
+        return []
+    points: list[list[float]] = []
+    for item in coordinates:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            return []
+        try:
+            lon, lat = float(item[0]), float(item[1])
+        except (TypeError, ValueError):
+            return []
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            return []
+        points.append([lat, lon])
+    return points
 
 
 OSRM_SERVICES = {WALK: "routed-foot", BIKE: "routed-bike", CAR: "routed-car"}
@@ -151,4 +174,4 @@ class OsmProvider:
                     summary = name.strip()
         except (KeyError, IndexError, TypeError, ValueError) as error:
             raise ServiceUnavailable("경로 응답 형식이 올바르지 않습니다.") from error
-        return RouteOption(mode, duration, distance, summary)
+        return RouteOption(mode, duration, distance, summary, geometry=_parse_geometry(first))

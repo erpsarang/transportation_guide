@@ -31,7 +31,7 @@ class FakeProvider:
         if destination.name == "부분" and mode == "car":
             raise ServiceUnavailable()
         seconds = {"walk": 1800, "bike": 600, "car": 900}[mode]
-        return RouteOption(mode, seconds, 2000, mode + " 경로")
+        return RouteOption(mode, seconds, 2000, mode + " 경로", geometry=[[37.0, 127.0], [37.5, 127.1]])
 
 
 class ServerTest(unittest.TestCase):
@@ -75,6 +75,13 @@ class ServerTest(unittest.TestCase):
         self.assertEqual([r["mode"] for r in body["routes"]], ["bike", "car", "walk"])
         self.assertTrue(body["routes"][0]["fastest"])
         self.assertEqual(body["unavailable"], [])
+
+    def test_response_has_origin_destination_and_geometry(self):
+        status, body = self.post({"destination": "시청", "lat": 37.0, "lon": 127.0})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["origin"], {"name": "현재 위치", "lat": 37.0, "lon": 127.0})
+        self.assertEqual(body["destination"], {"name": "시청", "lat": 37.5, "lon": 127.1})
+        self.assertEqual(body["routes"][0]["geometry"], [[37.0, 127.0], [37.5, 127.1]])
 
     def test_partial_failure_lists_unavailable_mode(self):
         status, body = self.post({"destination": "부분", "lat": 1, "lon": 1})
