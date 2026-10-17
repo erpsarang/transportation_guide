@@ -8,6 +8,8 @@
   body { font-family: sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
   label { display: block; margin-top: 1rem; font-weight: bold; }
   input { width: 100%; padding: 0.5rem; box-sizing: border-box; }
+  input[type=checkbox] { width: auto; }
+  label.inline { display: inline; margin-top: 0; font-weight: normal; }
   button { margin-top: 1rem; padding: 0.5rem 1rem; }
   .notice { margin-top: 1rem; padding: 0.5rem; background: #fff8e1; }
   .error { margin-top: 1rem; padding: 0.5rem; background: #fdecea; color: #b71c1c; }
@@ -29,6 +31,8 @@
   <div id="access-box" hidden>
     <label for="access-code">접근 코드</label>
     <input id="access-code" name="access_code" type="password" autocomplete="off">
+    <input id="show-access" type="checkbox">
+    <label for="show-access" class="inline">보기</label>
   </div>
   <button type="submit" id="submit">검색</button>
 </form>
@@ -52,6 +56,8 @@
   var ACCESS_KEY = "transportation_guide_access_code";
   var accessBox = document.getElementById("access-box");
   var accessInput = document.getElementById("access-code");
+  var showAccess = document.getElementById("show-access");
+  var NON_ASCII_MESSAGE = "접근 코드에는 영문, 숫자, 기호만 쓸 수 있습니다. 키보드를 영문으로 바꿔 주세요";
   var busyBox = document.getElementById("busy");
   var wakeTimer = null;
   var submit = document.getElementById("submit");
@@ -87,6 +93,10 @@
     errorBox.textContent = message;
     errorBox.hidden = false;
   }
+
+  showAccess.addEventListener("change", function () {
+    accessInput.type = showAccess.checked ? "text" : "password";
+  });
 
   function storedCode() {
     try { return localStorage.getItem(ACCESS_KEY) || ""; } catch (e) { return ""; }
@@ -179,9 +189,14 @@
       showError("출발지를 알 수 없습니다. 출발지 주소를 입력해 주세요.");
       return;
     }
+    var code = accessInput.value.trim() || storedCode();
+    if (/[^\x21-\x7e]/.test(code)) {
+      accessBox.hidden = false;
+      showError(NON_ASCII_MESSAGE);
+      return;
+    }
     submit.disabled = true;
     showBusy();
-    var code = accessInput.value.trim() || storedCode();
     var headers = { "Content-Type": "application/json" };
     if (code) headers["X-Access-Code"] = code;
     var controller = new AbortController();
@@ -199,11 +214,15 @@
       if (result.status === 401) {
         forgetCode();
         accessInput.value = "";
+        showAccess.checked = false;
+        accessInput.type = "password";
         accessBox.hidden = false;
         showError("접근 코드가 필요하거나 올바르지 않습니다. 접근 코드를 다시 입력해 주세요.");
         return;
       }
       if (code) storeCode(code);
+      accessBox.hidden = true;
+      accessInput.value = "";
       if (!result.ok) {
         showError(result.data.message || "문제가 발생했습니다. 다시 시도해 주세요.");
       } else if (!result.data.routes || !result.data.routes.length) {
