@@ -4,4 +4,4 @@
 
 - Source repository: `erpsarang/self-improvement-mvp`
 - Framework line: `v0.2`
-- Framework source SHA: `2c9e04ce6ab57357ef09b271cca5286f8a18dc11`
+- Framework source SHA: `6f4bfe124fc92e07a021eb8565984ed8aba117c9`
