@@ -16,6 +16,7 @@
   ul { list-style: none; padding: 0; }
   li { border: 1px solid #ccc; border-radius: 6px; padding: 0.75rem; margin-top: 0.5rem; }
   .badge { background: #1565c0; color: #fff; border-radius: 4px; padding: 0 0.4rem; margin-left: 0.5rem; font-size: 0.85em; }
+  .unavailable-title { margin: 1.5rem 0 0; font-size: 0.85rem; font-weight: normal; color: #757575; }
   [hidden] { display: none; }
 </style>
 </head>
@@ -40,7 +41,10 @@
 <div id="busy" class="notice" role="status" hidden></div>
 <div id="error" class="error" role="alert" hidden></div>
 <ul id="results"></ul>
-<ul id="unavailable"></ul>
+<div id="unavailable-box" hidden>
+  <h2 class="unavailable-title">결과를 받지 못한 이동 수단</h2>
+  <ul id="unavailable"></ul>
+</div>
 <script>
 (function () {
   var MODE_LABELS = { walk: "도보", bike: "자전거", car: "자동차" };
@@ -51,6 +55,7 @@
   var errorBox = document.getElementById("error");
   var results = document.getElementById("results");
   var unavailableList = document.getElementById("unavailable");
+  var unavailableBox = document.getElementById("unavailable-box");
   var FETCH_TIMEOUT_MS = 90000;
   var WAKE_NOTICE_MS = 15000;
   var ACCESS_KEY = "transportation_guide_access_code";
@@ -168,6 +173,7 @@
       item.textContent = (MODE_LABELS[entry.mode] || entry.mode) + ": " + entry.reason;
       unavailableList.appendChild(item);
     });
+    unavailableBox.hidden = items.length === 0;
   }
 
   form.addEventListener("submit", function (event) {
@@ -175,6 +181,7 @@
     errorBox.hidden = true;
     results.textContent = "";
     unavailableList.textContent = "";
+    unavailableBox.hidden = true;
     var body = { destination: document.getElementById("destination").value };
     if (position && originBox.hidden) {
       body.lat = position.lat;
