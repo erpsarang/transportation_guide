@@ -16,6 +16,7 @@
 - **Python 3, 표준 라이브러리만 쓴다.** `pip install`로 받는 외부 패키지를 쓰지 않는다. Framework의 검증·구현 실행 환경에는 Node만 설치되고 Python 패키지를 설치하는 단계가 없기 때문이다.
 - 웹 서버는 표준 라이브러리 `http.server`, 화면은 정적 HTML과 JavaScript 한 벌이다.
 - 외부 경로·주소 서비스는 한 모듈에 가두고, 테스트는 그 모듈을 가짜로 바꿔 **외부 서비스를 실제로 호출하지 않는다.**
+- 지도는 외부 지도 라이브러리 없이, 지도 이미지와 SVG 선으로 직접 그린다.
 - API key 같은 secret을 저장소에 기록하지 않는다.
 
 ## 구성
@@ -62,14 +63,20 @@ PYTHONPATH=src python3 -m transportation_guide.server
 - 검색 중에는 "검색 중입니다"가 보이고, 15초가 넘으면 "서버를 깨우는 중입니다. 최대 1분쯤 걸릴 수 있습니다"로 바뀌며 결과가 나오면 사라진다.
 - 출발지는 브라우저의 현재 위치다. 위치 허용을 거부하거나 오류가 나면 그 이유가 화면에 나오고, 출발지 주소를 직접 입력할 수 있다.
 - 주소를 찾지 못하거나 경로가 없거나 외부 서비스가 응답하지 않으면 이유와 다시 시도하라는 안내가 나온다.
-- API는 `POST /api/recommend` (JSON: `destination`, `lat`/`lon` 또는 `origin_address`)이며 `GET /api/recommend` 쿼리도 받는다.
+- 결과가 나오면 지도에 출발지와 목적지가 표시되고, 두 지점이 모두 보이는 크기로 열린다.
+- 지도에는 도보(초록)·자전거(주황)·자동차(보라) 경로가 색으로 구분되어 그려지고, 가장 빠른 경로가 처음 선택된 상태로 보인다.
+- 목록에서 이동 수단을 마우스나 키보드(Enter, Space)로 고르면 지도에서 그 경로가 강조된다.
+- 주소 서비스가 찾은 목적지 이름이 지도 위에 보인다.
+- 지도 이미지를 불러오지 못하거나 경로 좌표를 받지 못해도 목록은 그대로 나오고 이유가 안내된다. 일부 이동 수단의 결과가 없으면 그 수단의 선만 지도에서 빠진다.
+- API는 `POST /api/recommend` (JSON: `destination`, `lat`/`lon` 또는 `origin_address`)이며 `GET /api/recommend` 쿼리도 받는다. 응답의 `routes` 각 항목에는 지도용 `geometry`([위도, 경도] 좌표 목록, 받지 못하면 빈 목록)가 있고, 응답에는 `origin`과 `destination`(이름·좌표)이 있다.
 
 ### 사용하는 외부 서비스
 
-둘 다 API key나 가입이 필요 없는 공개 서비스이며, 호출은 `providers.py` 안에만 있다.
+서버가 호출하는 두 서비스는 API key나 가입이 필요 없는 공개 서비스이며, 서버의 호출은 `providers.py` 안에만 있다. 지도 이미지는 브라우저가 직접 받는다.
 
 - 주소 → 좌표: [OpenStreetMap Nominatim](https://nominatim.openstreetmap.org). 요청에 User-Agent `transportation_guide/0.1` 을 붙이고, 초당 1회를 넘겨 호출하지 않는다(주소 변환이 두 번이면 1초 이상 간격을 둔다).
-- 경로 조회: FOSSGIS가 운영하는 OSRM(`routing.openstreetmap.de`). 도보 `routed-foot`, 자전거 `routed-bike`, 자동차 `routed-car`.
+- 경로 조회: FOSSGIS가 운영하는 OSRM(`routing.openstreetmap.de`). 도보 `routed-foot`, 자전거 `routed-bike`, 자동차 `routed-car`. 이 호출은 지도에 그릴 경로 선(geojson 좌표)도 함께 받는다.
+- 지도 이미지: [OpenStreetMap](https://www.openstreetmap.org) 타일(`tile.openstreetmap.org`). 브라우저가 직접 받으며 서버를 거치지 않고, 화면에 출처(© OpenStreetMap contributors)가 표기된다.
 - 서버는 외부 서비스를 10초까지 기다리고, 화면은 서버를 90초까지 기다린다(무료 호스팅이 잠에서 깨는 시간을 견디기 위해서다). 일부 수단만 실패하면 나머지 결과와 함께 빠진 수단의 이유를 보여 준다.
 
 ### Render에 올리기
@@ -112,6 +119,7 @@ PYTHONPATH=src python3 -m transportation_guide.server
 ### 후속 범위
 
 - 주소 변환·경로 서비스는 연결되어 있다. 캐시, 로그인, 검색 기록은 없다.
-- 대중교통, 지도 표시는 다음 요구에서 다룬다.
+- 대중교통은 다음 요구에서 다룬다.
+- 지도에서 출발지·목적지를 직접 고르는 기능은 아직 없다.
 
 테스트(`npm test`)는 가짜 provider를 쓰므로 외부 서비스를 호출하지 않는다.
