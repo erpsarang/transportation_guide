@@ -25,7 +25,7 @@
   .map svg { position: absolute; left: 0; top: 0; }
   .map-attr { font-size: 0.75rem; color: #616161; margin-top: 0.25rem; }
   .recent-title { margin: 1rem 0 0; font-size: 0.9rem; font-weight: bold; }
-  #recent-list button { margin: 0.25rem 0.25rem 0 0; }
+  #recent-list button, #origin-recent-list button { margin: 0.25rem 0.25rem 0 0; }
   [hidden] { display: none; }
 </style>
 </head>
@@ -42,6 +42,11 @@
   <div id="origin-box" hidden>
     <label for="origin-address">출발지 주소</label>
     <input id="origin-address" name="origin_address" autocomplete="off">
+    <div id="origin-recent-box" hidden>
+      <h2 class="recent-title">최근 출발지</h2>
+      <div id="origin-recent-list"></div>
+      <button type="button" id="origin-recent-clear">지우기</button>
+    </div>
   </div>
   <div id="access-box" hidden>
     <label for="access-code">접근 코드</label>
@@ -477,6 +482,56 @@
 
   renderRecent();
 
+  var ORIGIN_RECENT_KEY = "transportation_guide_recent_origins";
+  var originRecentBox = document.getElementById("origin-recent-box");
+  var originRecentList = document.getElementById("origin-recent-list");
+  var originRecentClear = document.getElementById("origin-recent-clear");
+
+  function readRecentOrigins() {
+    try {
+      var parsed = JSON.parse(localStorage.getItem(ORIGIN_RECENT_KEY) || "[]");
+      if (!Array.isArray(parsed)) return [];
+      return parsed.filter(function (value) {
+        return typeof value === "string" && value.trim() !== "";
+      }).slice(0, RECENT_MAX);
+    } catch (e) { return []; }
+  }
+
+  function writeRecentOrigins(list) {
+    try { localStorage.setItem(ORIGIN_RECENT_KEY, JSON.stringify(list)); } catch (e) {}
+  }
+
+  function renderRecentOrigins() {
+    var list = readRecentOrigins();
+    originRecentList.textContent = "";
+    list.forEach(function (text) {
+      var button = document.createElement("button");
+      button.type = "button";
+      button.textContent = text;
+      button.addEventListener("click", function () {
+        originInput.value = text;
+        originInput.focus();
+      });
+      originRecentList.appendChild(button);
+    });
+    originRecentBox.hidden = list.length === 0;
+  }
+
+  function saveRecentOrigin(text) {
+    if (!text) return;
+    var list = readRecentOrigins().filter(function (value) { return value !== text; });
+    list.unshift(text);
+    writeRecentOrigins(list.slice(0, RECENT_MAX));
+    renderRecentOrigins();
+  }
+
+  originRecentClear.addEventListener("click", function () {
+    try { localStorage.removeItem(ORIGIN_RECENT_KEY); } catch (e) {}
+    renderRecentOrigins();
+  });
+
+  renderRecentOrigins();
+
   function renderUnavailable(items) {
     unavailableList.textContent = "";
     items.forEach(function (entry) {
@@ -496,11 +551,13 @@
     clearMap();
     var body = { destination: document.getElementById("destination").value };
     var requestedDestination = body.destination.trim();
+    var requestedOrigin = "";
     if (position && originBox.hidden) {
       body.lat = position.lat;
       body.lon = position.lon;
     } else if (originInput.value.trim()) {
       body.origin_address = originInput.value;
+      requestedOrigin = originInput.value.trim();
     } else if (position) {
       body.lat = position.lat;
       body.lon = position.lon;
@@ -550,6 +607,7 @@
       } else {
         render(result.data.routes, result.data);
         saveRecent(requestedDestination);
+        saveRecentOrigin(requestedOrigin);
         renderUnavailable(result.data.unavailable || []);
         showMap(result.data);
       }
